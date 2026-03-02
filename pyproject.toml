@@ -1,0 +1,23 @@
+[project]
+name = "momentum-bot"
+version = "0.1.0"
+description = "Generic momentum trading bot for Hyperliquid and other exchanges"
+requires-python = ">=3.10"
+dependencies = [
+    "hyperliquid-python-sdk>=0.4.0",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "websockets>=12.0",
+    "pyyaml>=6.0",
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+momentum-bot = "momentum_bot.main:main"

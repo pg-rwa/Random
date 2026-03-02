@@ -1,0 +1,48 @@
+# Alt Token Momentum Configuration
+# For mid/large cap altcoins on Hyperliquid
+
+symbols:
+  - DOGE
+  - AVAX
+  - LINK
+  - ARB
+
+interval: "5m"
+candle_limit: 100
+loop_interval_seconds: 30
+leverage: 2
+
+indicators:
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_period: 14
+  volume_sma_period: 20
+
+strategy:
+  rsi_buy_min: 52        # Slightly higher entry bar for alts
+  rsi_buy_max: 78        # Alts can run further before exhaustion
+  rsi_sell_min: 22
+  rsi_sell_max: 48
+  volume_threshold: 1.5  # Higher volume confirmation for alts
+  min_confidence: 0.65
+  rsi_exit_long_below: 45
+  rsi_exit_short_above: 55
+  weights:
+    ema_trend: 0.20
+    ema_cross: 0.15
+    rsi_zone: 0.20
+    macd_accel: 0.20
+    volume: 0.15
+    vwap: 0.10
+
+risk:
+  max_risk_per_trade_pct: 0.75  # Lower per-trade risk for volatile alts
+  max_consecutive_losses: 3
+  cooldown_seconds: 3600
+  daily_loss_limit_pct: 4.0
+  max_open_positions: 2
+  trailing_stop_atr_mult: 2.0   # Wider stops for alt volatility

@@ -1,0 +1,51 @@
+# Commodities Momentum Configuration
+# For gold, silver, crude oil tokens on Hyperliquid or similar exchanges
+#
+# NOTE: Hyperliquid lists commodities as perpetuals with tickers like:
+#   GOLD (or XAU), SILVER (or XAG), OIL (or WTI)
+# Verify exact ticker symbols on the exchange before running.
+
+symbols:
+  - GOLD
+  - SILVER
+  - OIL
+
+interval: "15m"      # Commodities tend to trend on longer timeframes
+candle_limit: 100
+loop_interval_seconds: 60
+leverage: 2
+
+indicators:
+  ema_fast: 12       # Slightly slower EMAs for commodity trends
+  ema_slow: 26
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_period: 14
+  volume_sma_period: 20
+
+strategy:
+  rsi_buy_min: 50
+  rsi_buy_max: 70    # Tighter RSI range — commodities trend differently
+  rsi_sell_min: 30
+  rsi_sell_max: 50
+  volume_threshold: 1.5   # Higher volume bar — commodity volumes are spikier
+  min_confidence: 0.65    # Slightly higher confidence required
+  rsi_exit_long_below: 45
+  rsi_exit_short_above: 55
+  weights:
+    ema_trend: 0.25       # EMA trend matters more for commodities
+    ema_cross: 0.15
+    rsi_zone: 0.15
+    macd_accel: 0.20
+    volume: 0.15
+    vwap: 0.10
+
+risk:
+  max_risk_per_trade_pct: 0.75  # Lower risk for commodities — can be volatile
+  max_consecutive_losses: 3
+  cooldown_seconds: 3600
+  daily_loss_limit_pct: 4.0
+  max_open_positions: 2
+  trailing_stop_atr_mult: 2.0   # Wider stops for commodity volatility
