@@ -189,7 +189,11 @@ class MomentumStrategy:
         return score, reasons
 
     def _check_exit_long(self, ind: dict) -> SignalResult | None:
-        """Check if we should exit a long position."""
+        """Check if we should exit a long position.
+
+        Requires at least 2 confirming conditions to avoid premature exits
+        from momentary noise (e.g. a single bad MACD bar).
+        """
         reasons = []
 
         if ind["close"] < ind["ema_slow"]:
@@ -199,12 +203,16 @@ class MomentumStrategy:
         if ind["macd_histogram"] < 0 and ind["macd_histogram"] < ind["macd_histogram_prev"]:
             reasons.append("MACD histogram turned negative & decreasing")
 
-        if reasons:
+        if len(reasons) >= 2:
             return SignalResult(Signal.CLOSE_LONG, 0.8, reasons)
         return None
 
     def _check_exit_short(self, ind: dict) -> SignalResult | None:
-        """Check if we should exit a short position."""
+        """Check if we should exit a short position.
+
+        Requires at least 2 confirming conditions to avoid premature exits
+        from momentary noise.
+        """
         reasons = []
 
         if ind["close"] > ind["ema_slow"]:
@@ -214,6 +222,6 @@ class MomentumStrategy:
         if ind["macd_histogram"] > 0 and ind["macd_histogram"] > ind["macd_histogram_prev"]:
             reasons.append("MACD histogram turned positive & increasing")
 
-        if reasons:
+        if len(reasons) >= 2:
             return SignalResult(Signal.CLOSE_SHORT, 0.8, reasons)
         return None

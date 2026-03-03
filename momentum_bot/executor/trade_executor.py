@@ -65,6 +65,14 @@ class TradeExecutor:
         if signal.signal in (Signal.CLOSE_LONG, Signal.CLOSE_SHORT):
             return await self._close_position(symbol, position, signal, current_price)
 
+        # Block new entries if already in a position — must close first
+        if position["size"] > 0:
+            logger.debug(
+                "Already in %s position for %s, ignoring %s signal",
+                position["side"], symbol, signal.signal.value,
+            )
+            return None
+
         # Check risk rules for new trades
         can_trade, reason = self.risk.can_trade()
         if not can_trade:
