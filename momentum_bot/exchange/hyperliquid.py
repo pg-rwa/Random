@@ -29,21 +29,34 @@ class HyperliquidExchange(ExchangeBase):
 
     def __init__(self, secret_key: str, wallet_address: str, testnet: bool = True):
         self._wallet = wallet_address
-        base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
-        self._info = Info(base_url, skip_ws=True)
-        self._exchange = Exchange(
-            wallet=None,  # Will be set up with proper signing
-            base_url=base_url,
-            account_address=wallet_address,
-        )
+        self._base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
         self._secret_key = secret_key
         self._testnet = testnet
+        # Lazy-initialized to avoid network calls during construction
+        self.__info: Optional[Info] = None
+        self.__exchange: Optional[Exchange] = None
         logger.info(
             "Hyperliquid exchange initialized (testnet=%s, wallet=%s...%s)",
             testnet,
-            wallet_address[:6],
-            wallet_address[-4:],
+            wallet_address[:6] if wallet_address else "N/A",
+            wallet_address[-4:] if wallet_address else "N/A",
         )
+
+    @property
+    def _info(self) -> Info:
+        if self.__info is None:
+            self.__info = Info(self._base_url, skip_ws=True)
+        return self.__info
+
+    @property
+    def _exchange(self) -> Exchange:
+        if self.__exchange is None:
+            self.__exchange = Exchange(
+                wallet=None,
+                base_url=self._base_url,
+                account_address=self._wallet,
+            )
+        return self.__exchange
 
     async def get_candles(
         self, symbol: str, interval: str, limit: int = 100
