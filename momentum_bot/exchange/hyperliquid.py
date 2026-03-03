@@ -1,6 +1,7 @@
 """Hyperliquid exchange integration."""
 
 import logging
+import time
 from typing import Optional
 
 from hyperliquid.info import Info
@@ -50,7 +51,8 @@ class HyperliquidExchange(ExchangeBase):
         hl_interval = INTERVAL_MAP.get(interval, interval)
 
         # Hyperliquid SDK uses synchronous calls
-        raw = self._info.candles_snapshot(symbol, hl_interval, limit)
+        end_time = int(time.time() * 1000)  # current time in ms
+        raw = self._info.candles_snapshot(symbol, hl_interval, limit, end_time)
 
         candles = []
         for c in raw:
