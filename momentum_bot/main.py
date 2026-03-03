@@ -107,7 +107,14 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     positions = await exchange.get_all_positions()
                     risk_mgr.set_open_positions(len(positions))
                 else:
-                    current_side = "none"
+                    paper_pos = executor.get_paper_position(symbol)
+                    current_side = paper_pos["side"]
+                    # Track open paper positions for risk manager
+                    open_count = sum(
+                        1 for p in (executor.get_paper_position(s) for s in symbols)
+                        if p["size"] > 0
+                    )
+                    risk_mgr.set_open_positions(open_count)
 
                 # 4. Generate signal
                 signal = strategy.evaluate(indicators, current_side)

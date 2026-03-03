@@ -35,9 +35,15 @@ class TradeExecutor:
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._trade_log: list[dict] = []
+        # Track simulated positions in paper mode: {symbol: {side, size, entry_price}}
+        self._paper_positions: dict[str, dict] = {}
 
         mode = "PAPER" if paper_trade else "LIVE"
         logger.info("TradeExecutor initialized in %s mode", mode)
+
+    def get_paper_position(self, symbol: str) -> dict:
+        """Return the tracked paper position for a symbol."""
+        return self._paper_positions.get(symbol, {"size": 0, "side": "none", "entry_price": 0})
 
     async def execute_signal(
         self, symbol: str, signal: SignalResult, indicators: dict
@@ -51,7 +57,7 @@ class TradeExecutor:
 
         # Get current state
         equity = await self.exchange.get_balance() if not self.paper_trade else 10000.0
-        position = await self.exchange.get_position(symbol) if not self.paper_trade else {"size": 0, "side": "none"}
+        position = await self.exchange.get_position(symbol) if not self.paper_trade else self.get_paper_position(symbol)
         current_price = indicators.get("close", 0)
         atr = indicators.get("atr", 0)
 
@@ -100,6 +106,12 @@ class TradeExecutor:
         if self.paper_trade:
             trade_record["mode"] = "paper"
             trade_record["status"] = "filled"
+            # Track simulated position so the strategy knows we're in a trade
+            self._paper_positions[symbol] = {
+                "side": side,
+                "size": size,
+                "entry_price": current_price,
+            }
             logger.info(
                 "[PAPER] %s %s %.4f @ %.2f | SL=%.2f TP=%.2f | %s",
                 signal.signal.value, symbol, size, current_price,
@@ -152,18 +164,20 @@ class TradeExecutor:
             "side": "close",
             "close_price": current_price,
             "size": size,
-            "entry_price": position["entry_price"],
+            "entry_price": position.get("entry_price", current_price),
             "pnl": position.get("unrealized_pnl", 0),
         }
 
         if self.paper_trade:
-            pnl = (current_price - position["entry_price"]) * size
+            pnl = (current_price - position.get("entry_price", current_price)) * size
             if position["side"] == "sell":
                 pnl = -pnl
             trade_record["pnl"] = pnl
             trade_record["mode"] = "paper"
             trade_record["status"] = "closed"
             self.risk.record_trade_result(pnl)
+            # Clear the simulated position
+            self._paper_positions.pop(symbol, None)
             logger.info(
                 "[PAPER] CLOSE %s %.4f @ %.2f | PnL=%.2f | %s",
                 symbol, size, current_price, pnl, signal,
