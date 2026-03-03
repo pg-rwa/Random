@@ -1,23 +1,38 @@
 """Simple web dashboard for monitoring the momentum bot."""
 
 import json
+import logging
 import os
-import time
 from pathlib import Path
 
 from aiohttp import web
 from dotenv import load_dotenv
-from hyperliquid.info import Info
-from hyperliquid.utils import constants
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 TRADES_DIR = Path("trades")
 WALLET = os.getenv("HL_WALLET_ADDRESS", "")
 TESTNET = os.getenv("HL_TESTNET", "true").lower() == "true"
 
-base_url = constants.TESTNET_API_URL if TESTNET else constants.MAINNET_API_URL
-info = Info(base_url, skip_ws=True)
+_info = None
+
+
+def _get_info():
+    """Lazily create the Hyperliquid Info client."""
+    global _info
+    if _info is None:
+        try:
+            from hyperliquid.info import Info
+            from hyperliquid.utils import constants
+
+            base_url = constants.TESTNET_API_URL if TESTNET else constants.MAINNET_API_URL
+            _info = Info(base_url, skip_ws=True)
+        except Exception as e:
+            logger.warning("Could not connect to Hyperliquid: %s", e)
+            return None
+    return _info
 
 
 def _load_trades(days: int = 7) -> list[dict]:
@@ -45,7 +60,8 @@ async def handle_api_status(request: web.Request) -> web.Response:
     data: dict = {"wallet": WALLET, "testnet": TESTNET, "positions": [], "balance": 0}
 
     try:
-        if WALLET:
+        info = _get_info()
+        if WALLET and info:
             state = info.user_state(WALLET)
             margin = state.get("marginSummary", {})
             data["balance"] = float(margin.get("accountValue", 0))
