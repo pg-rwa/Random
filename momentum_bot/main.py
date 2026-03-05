@@ -108,7 +108,8 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                 if paper_trade:
                     stop_trade = await executor.check_stops(symbol, indicators["close"])
                     if stop_trade:
-                        logger.info("[%s] Position closed by %s", symbol, stop_trade["signal"])
+                        logger.info("[%s] Position closed by %s — skipping rest of cycle", symbol, stop_trade["signal"])
+                        continue  # Don't re-enter in the same cycle; let cooldown apply next cycle
 
                 # 4. Get current position
                 if not paper_trade:

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -144,15 +145,22 @@ class TradeExecutor:
         current_price = indicators.get("close", 0)
         atr = indicators.get("atr", 0)
 
+        logger.info(
+            "[%s] execute_signal: signal=%s | pos_size=%s pos_side=%s | atr=%s",
+            symbol, signal.signal.value, position["size"], position["side"], atr,
+        )
+
         # Handle close signals
         if signal.signal in (Signal.CLOSE_LONG, Signal.CLOSE_SHORT):
             return await self._close_position(symbol, position, signal, current_price)
 
         # Block new entries if already in a position — must close first
-        if position["size"] > 0:
-            logger.debug(
-                "Already in %s position for %s, ignoring %s signal",
-                position["side"], symbol, signal.signal.value,
+        # Use > 0 with explicit NaN guard (NaN > 0 is False in Python)
+        pos_size = position["size"]
+        if pos_size != 0 and pos_size == pos_size:  # NaN != NaN, so this catches NaN too
+            logger.info(
+                "[%s] BLOCKED: already in %s position (size=%.4f), ignoring %s signal",
+                symbol, position["side"], pos_size, signal.signal.value,
             )
             return None
 
@@ -170,8 +178,8 @@ class TradeExecutor:
         side = "buy" if signal.signal == Signal.BUY else "sell"
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
-        if atr <= 0:
-            logger.warning("ATR is zero, cannot calculate stop. Skipping trade.")
+        if atr <= 0 or math.isnan(float(atr)):
+            logger.warning("ATR is zero or NaN (%.4f), cannot calculate stop. Skipping trade.", atr)
             return None
 
         stop_price = self.risk.calculate_stop_loss(current_price, atr, side)
