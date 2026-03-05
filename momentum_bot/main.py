@@ -38,7 +38,10 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
     # Initialize exchange
     secret_key = os.getenv("HL_SECRET_KEY", "")
     wallet = os.getenv("HL_WALLET_ADDRESS", "")
-    testnet = os.getenv("HL_TESTNET", "false").lower() == "true"
+    testnet_env = os.getenv("HL_TESTNET")
+    testnet = (testnet_env or "false").lower() == "true"
+    logger.info("Network: HL_TESTNET=%s → testnet=%s → using %s",
+                testnet_env, testnet, "TESTNET" if testnet else "MAINNET")
 
     if not paper_trade and (not secret_key or not wallet):
         logger.error("HL_SECRET_KEY and HL_WALLET_ADDRESS required for live trading. Set in .env file.")
