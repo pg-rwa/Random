@@ -104,14 +104,20 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     logger.warning("[%s] Indicator computation failed. Skipping.", symbol)
                     continue
 
-                # 3. Check stop-loss / take-profit for paper positions
+                # 3. Fetch live mid-price for accurate paper trading
+                live_price = await exchange.get_price(symbol)
+
+                # 4. Check stop-loss / take-profit for paper positions
                 if paper_trade:
-                    stop_trade = await executor.check_stops(symbol, indicators["close"])
+                    stop_trade = await executor.check_stops(symbol, live_price)
                     if stop_trade:
                         logger.info("[%s] Position closed by %s — skipping rest of cycle", symbol, stop_trade["signal"])
                         continue  # Don't re-enter in the same cycle; let cooldown apply next cycle
 
-                # 4. Get current position
+                # Override close price with live mid-price for accurate entry/exit
+                indicators["close"] = live_price
+
+                # 5. Get current position
                 if not paper_trade:
                     pos = await exchange.get_position(symbol)
                     current_side = pos["side"]
@@ -127,11 +133,11 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     )
                     risk_mgr.set_open_positions(open_count)
 
-                # 5. Generate signal
+                # 6. Generate signal
                 signal = strategy.evaluate(indicators, current_side)
 
                 logger.info(
-                    "[%s] Price=%.2f | EMA(f)=%.2f EMA(s)=%.2f | RSI=%.1f | MACD-H=%.4f | Vol=%.1fx | Pos=%s | Signal: %s",
+                    "[%s] Price=%.2f (live) | EMA(f)=%.2f EMA(s)=%.2f | RSI=%.1f | MACD-H=%.4f | Vol=%.1fx | Pos=%s | Signal: %s",
                     symbol,
                     indicators["close"],
                     indicators["ema_fast"],
@@ -143,7 +149,7 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     signal,
                 )
 
-                # 6. Execute if there's a trade signal
+                # 7. Execute if there's a trade signal
                 trade = await executor.execute_signal(symbol, signal, indicators)
                 if trade:
                     logger.info("[%s] >>> TRADE EXECUTED: %s %s @ %.2f", symbol, trade.get("signal"), trade.get("side"), trade.get("entry_price", trade.get("close_price", 0)))
