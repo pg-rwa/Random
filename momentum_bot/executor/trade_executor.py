@@ -42,6 +42,8 @@ class TradeExecutor:
         self._paper_positions: dict[str, dict] = {}
         # Track when each symbol last closed a position (for re-entry cooldown)
         self._last_close_time: dict[str, float] = {}
+        # Track when each symbol last OPENED a position (hard safeguard)
+        self._last_entry_time: dict[str, float] = {}
 
         mode = "PAPER" if paper_trade else "LIVE"
         logger.info("TradeExecutor initialized in %s mode", mode)
@@ -168,6 +170,16 @@ class TradeExecutor:
         if self.is_in_reentry_cooldown(symbol):
             return None
 
+        # Hard safeguard: minimum 5 minutes between entries for the same symbol
+        last_entry = self._last_entry_time.get(symbol, 0)
+        since_last_entry = time.time() - last_entry
+        if since_last_entry < self.reentry_cooldown:
+            logger.info(
+                "[%s] BLOCKED: only %ds since last entry (need %ds)",
+                symbol, int(since_last_entry), self.reentry_cooldown,
+            )
+            return None
+
         # Check risk rules for new trades
         can_trade, reason = self.risk.can_trade()
         if not can_trade:
@@ -209,6 +221,7 @@ class TradeExecutor:
         if self.paper_trade:
             trade_record["mode"] = "paper"
             trade_record["status"] = "filled"
+            self._last_entry_time[symbol] = time.time()
             # Track simulated position with SL/TP so check_stops() can enforce them
             self._paper_positions[symbol] = {
                 "side": side,
@@ -229,6 +242,7 @@ class TradeExecutor:
                 size=size,
             )
             trade_record["mode"] = "live"
+            self._last_entry_time[symbol] = time.time()
             trade_record["order_result"] = {
                 "success": result.success,
                 "order_id": result.order_id,

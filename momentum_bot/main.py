@@ -131,7 +131,7 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                 signal = strategy.evaluate(indicators, current_side)
 
                 logger.info(
-                    "[%s] Price=%.2f | EMA(f)=%.2f EMA(s)=%.2f | RSI=%.1f | MACD-H=%.4f | Vol=%.1fx | Signal: %s",
+                    "[%s] Price=%.2f | EMA(f)=%.2f EMA(s)=%.2f | RSI=%.1f | MACD-H=%.4f | Vol=%.1fx | Pos=%s | Signal: %s",
                     symbol,
                     indicators["close"],
                     indicators["ema_fast"],
@@ -139,13 +139,16 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     indicators["rsi"],
                     indicators["macd_histogram"],
                     indicators["volume_ratio"],
+                    current_side,
                     signal,
                 )
 
                 # 6. Execute if there's a trade signal
                 trade = await executor.execute_signal(symbol, signal, indicators)
                 if trade:
-                    logger.info("[%s] Trade executed: %s", symbol, trade.get("status"))
+                    logger.info("[%s] >>> TRADE EXECUTED: %s %s @ %.2f", symbol, trade.get("signal"), trade.get("side"), trade.get("entry_price", trade.get("close_price", 0)))
+                elif signal.signal.value not in ("HOLD",):
+                    logger.info("[%s] Signal %s was NOT executed (blocked by position/cooldown/risk)", symbol, signal.signal.value)
 
             except Exception as e:
                 logger.error("[%s] Error in cycle: %s", symbol, e, exc_info=True)
