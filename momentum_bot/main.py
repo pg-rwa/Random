@@ -49,7 +49,11 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
     # Initialize components
     strategy = MomentumStrategy(config.get("strategy", {}))
     risk_mgr = RiskManager(config.get("risk", {}))
-    executor = TradeExecutor(exchange, risk_mgr, paper_trade=paper_trade)
+    reentry_cooldown = config.get("strategy", {}).get("reentry_cooldown_seconds", 300)
+    executor = TradeExecutor(
+        exchange, risk_mgr, paper_trade=paper_trade,
+        reentry_cooldown_seconds=reentry_cooldown,
+    )
 
     symbols = config.get("symbols", ["BTC"])
     interval = config.get("interval", "5m")
@@ -100,7 +104,13 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     logger.warning("[%s] Indicator computation failed. Skipping.", symbol)
                     continue
 
-                # 3. Get current position
+                # 3. Check stop-loss / take-profit for paper positions
+                if paper_trade:
+                    stop_trade = await executor.check_stops(symbol, indicators["close"])
+                    if stop_trade:
+                        logger.info("[%s] Position closed by %s", symbol, stop_trade["signal"])
+
+                # 4. Get current position
                 if not paper_trade:
                     pos = await exchange.get_position(symbol)
                     current_side = pos["side"]
@@ -116,7 +126,7 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     )
                     risk_mgr.set_open_positions(open_count)
 
-                # 4. Generate signal
+                # 5. Generate signal
                 signal = strategy.evaluate(indicators, current_side)
 
                 logger.info(
@@ -131,7 +141,7 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                     signal,
                 )
 
-                # 5. Execute if there's a trade signal
+                # 6. Execute if there's a trade signal
                 trade = await executor.execute_signal(symbol, signal, indicators)
                 if trade:
                     logger.info("[%s] Trade executed: %s", symbol, trade.get("status"))

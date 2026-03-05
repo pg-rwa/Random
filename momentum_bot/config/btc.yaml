@@ -27,7 +27,8 @@ strategy:
   rsi_sell_min: 25
   rsi_sell_max: 50
   volume_threshold: 1.3
-  min_confidence: 0.60
+  min_confidence: 0.70
+  reentry_cooldown_seconds: 300
   rsi_exit_long_below: 45
   rsi_exit_short_above: 55
   weights:

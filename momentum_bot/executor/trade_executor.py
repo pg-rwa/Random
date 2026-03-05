@@ -28,15 +28,19 @@ class TradeExecutor:
         risk_manager: RiskManager,
         paper_trade: bool = True,
         log_dir: str = "trades",
+        reentry_cooldown_seconds: int = 300,
     ):
         self.exchange = exchange
         self.risk = risk_manager
         self.paper_trade = paper_trade
+        self.reentry_cooldown = reentry_cooldown_seconds
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._trade_log: list[dict] = []
-        # Track simulated positions in paper mode: {symbol: {side, size, entry_price}}
+        # Track simulated positions in paper mode: {symbol: {side, size, entry_price, stop_loss, take_profit}}
         self._paper_positions: dict[str, dict] = {}
+        # Track when each symbol last closed a position (for re-entry cooldown)
+        self._last_close_time: dict[str, float] = {}
 
         mode = "PAPER" if paper_trade else "LIVE"
         logger.info("TradeExecutor initialized in %s mode", mode)
@@ -44,6 +48,85 @@ class TradeExecutor:
     def get_paper_position(self, symbol: str) -> dict:
         """Return the tracked paper position for a symbol."""
         return self._paper_positions.get(symbol, {"size": 0, "side": "none", "entry_price": 0})
+
+    def is_in_reentry_cooldown(self, symbol: str) -> bool:
+        """Check if symbol is in re-entry cooldown after a recent close."""
+        last_close = self._last_close_time.get(symbol, 0)
+        remaining = self.reentry_cooldown - (time.time() - last_close)
+        if remaining > 0:
+            logger.info("[%s] Re-entry cooldown: %ds remaining", symbol, int(remaining))
+            return True
+        return False
+
+    async def check_stops(self, symbol: str, current_price: float) -> dict | None:
+        """Check if current price hit stop-loss or take-profit for a paper position.
+
+        Returns trade record if position was closed, None otherwise.
+        """
+        pos = self._paper_positions.get(symbol)
+        if not pos or pos.get("size", 0) == 0:
+            return None
+
+        stop_loss = pos.get("stop_loss", 0)
+        take_profit = pos.get("take_profit", 0)
+        side = pos["side"]
+
+        hit_stop = False
+        hit_tp = False
+        reason = ""
+
+        if side == "buy":
+            if stop_loss > 0 and current_price <= stop_loss:
+                hit_stop = True
+                reason = f"Stop-loss hit (price {current_price:.2f} <= SL {stop_loss:.2f})"
+            elif take_profit > 0 and current_price >= take_profit:
+                hit_tp = True
+                reason = f"Take-profit hit (price {current_price:.2f} >= TP {take_profit:.2f})"
+        elif side == "sell":
+            if stop_loss > 0 and current_price >= stop_loss:
+                hit_stop = True
+                reason = f"Stop-loss hit (price {current_price:.2f} >= SL {stop_loss:.2f})"
+            elif take_profit > 0 and current_price <= take_profit:
+                hit_tp = True
+                reason = f"Take-profit hit (price {current_price:.2f} <= TP {take_profit:.2f})"
+
+        if not hit_stop and not hit_tp:
+            return None
+
+        # Close the position
+        exit_price = stop_loss if hit_stop else take_profit
+        pnl = (exit_price - pos["entry_price"]) * pos["size"]
+        if side == "sell":
+            pnl = -pnl
+
+        signal_type = "STOP_LOSS" if hit_stop else "TAKE_PROFIT"
+        trade_record = {
+            "timestamp": time.time(),
+            "symbol": symbol,
+            "signal": signal_type,
+            "reasons": [reason],
+            "side": "close",
+            "close_price": exit_price,
+            "size": pos["size"],
+            "entry_price": pos["entry_price"],
+            "pnl": pnl,
+            "mode": "paper",
+            "status": "closed",
+        }
+
+        self.risk.record_trade_result(pnl)
+        self._paper_positions.pop(symbol, None)
+        self._last_close_time[symbol] = time.time()
+
+        logger.info(
+            "[PAPER] %s %s %.4f @ %.2f | Entry=%.2f | PnL=%.2f | %s",
+            signal_type, symbol, pos["size"], exit_price,
+            pos["entry_price"], pnl, reason,
+        )
+
+        self._trade_log.append(trade_record)
+        self._persist_trade(trade_record)
+        return trade_record
 
     async def execute_signal(
         self, symbol: str, signal: SignalResult, indicators: dict
@@ -71,6 +154,10 @@ class TradeExecutor:
                 "Already in %s position for %s, ignoring %s signal",
                 position["side"], symbol, signal.signal.value,
             )
+            return None
+
+        # Block re-entry during cooldown after closing
+        if self.is_in_reentry_cooldown(symbol):
             return None
 
         # Check risk rules for new trades
@@ -114,11 +201,13 @@ class TradeExecutor:
         if self.paper_trade:
             trade_record["mode"] = "paper"
             trade_record["status"] = "filled"
-            # Track simulated position so the strategy knows we're in a trade
+            # Track simulated position with SL/TP so check_stops() can enforce them
             self._paper_positions[symbol] = {
                 "side": side,
                 "size": size,
                 "entry_price": current_price,
+                "stop_loss": stop_price,
+                "take_profit": take_profit,
             }
             logger.info(
                 "[PAPER] %s %s %.4f @ %.2f | SL=%.2f TP=%.2f | %s",
@@ -184,8 +273,9 @@ class TradeExecutor:
             trade_record["mode"] = "paper"
             trade_record["status"] = "closed"
             self.risk.record_trade_result(pnl)
-            # Clear the simulated position
+            # Clear the simulated position and start re-entry cooldown
             self._paper_positions.pop(symbol, None)
+            self._last_close_time[symbol] = time.time()
             logger.info(
                 "[PAPER] CLOSE %s %.4f @ %.2f | PnL=%.2f | %s",
                 symbol, size, current_price, pnl, signal,
