@@ -40,6 +40,9 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
     wallet = os.getenv("HL_WALLET_ADDRESS", "")
     testnet_env = os.getenv("HL_TESTNET")
     testnet = (testnet_env or "false").lower() == "true"
+    # Paper trading always uses mainnet for real prices — no risk since we never place orders
+    if paper_trade:
+        testnet = False
     logger.info("Network: HL_TESTNET=%s → testnet=%s → using %s",
                 testnet_env, testnet, "TESTNET" if testnet else "MAINNET")
 
