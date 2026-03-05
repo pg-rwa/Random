@@ -44,7 +44,7 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
         logger.error("HL_SECRET_KEY and HL_WALLET_ADDRESS required for live trading. Set in .env file.")
         sys.exit(1)
 
-    exchange = HyperliquidExchange(secret_key, wallet, testnet=testnet or paper_trade)
+    exchange = HyperliquidExchange(secret_key, wallet, testnet=testnet)
 
     # Initialize components
     strategy = MomentumStrategy(config.get("strategy", {}))
