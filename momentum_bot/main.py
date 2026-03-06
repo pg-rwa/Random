@@ -143,13 +143,14 @@ async def run_bot(config: dict, paper_trade: bool = True) -> None:
                 signal = strategy.evaluate(indicators, current_side)
 
                 logger.info(
-                    "[%s] Price=%.2f (live) | EMA(f)=%.2f EMA(s)=%.2f | RSI=%.1f | MACD-H=%.4f | Vol=%.1fx | Pos=%s | Signal: %s",
+                    "[%s] Price=%.2f (live) | EMA(f)=%.2f EMA(s)=%.2f | RSI=%.1f | MACD-H=%.4f | ADX=%.1f | Vol=%.1fx | Pos=%s | Signal: %s",
                     symbol,
                     indicators["close"],
                     indicators["ema_fast"],
                     indicators["ema_slow"],
                     indicators["rsi"],
                     indicators["macd_histogram"],
+                    indicators.get("adx", 0),
                     indicators["volume_ratio"],
                     current_side,
                     signal,

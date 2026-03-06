@@ -4,9 +4,9 @@
 symbols:
   - BTC
 
-interval: "5m"
+interval: "15m"
 candle_limit: 100
-loop_interval_seconds: 30
+loop_interval_seconds: 60
 leverage: 3
 
 # Indicator parameters
@@ -26,9 +26,10 @@ strategy:
   rsi_buy_max: 75
   rsi_sell_min: 25
   rsi_sell_max: 50
-  volume_threshold: 1.3
-  min_confidence: 0.70
-  reentry_cooldown_seconds: 300
+  volume_threshold: 1.5
+  min_confidence: 0.80
+  adx_trend_threshold: 25.0
+  reentry_cooldown_seconds: 600
   rsi_exit_long_below: 45
   rsi_exit_short_above: 55
   weights:
@@ -46,4 +47,4 @@ risk:
   cooldown_seconds: 3600
   daily_loss_limit_pct: 5.0
   max_open_positions: 3
-  trailing_stop_atr_mult: 1.5
+  trailing_stop_atr_mult: 2.5

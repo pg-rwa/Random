@@ -102,6 +102,67 @@ class TechnicalIndicators:
         return atr
 
     @staticmethod
+    def adx(candles: list[Candle], period: int = 14) -> np.ndarray:
+        """Average Directional Index — measures trend strength (0-100).
+
+        ADX > 25 indicates a strong trend; ADX < 20 indicates ranging/choppy.
+        """
+        n = len(candles)
+        highs = np.array([c.high for c in candles])
+        lows = np.array([c.low for c in candles])
+        closes = np.array([c.close for c in candles])
+
+        adx_out = np.full(n, np.nan)
+        if n < period * 2 + 1:
+            return adx_out
+
+        # True Range, +DM, -DM
+        tr = np.empty(n)
+        plus_dm = np.empty(n)
+        minus_dm = np.empty(n)
+        tr[0] = highs[0] - lows[0]
+        plus_dm[0] = 0.0
+        minus_dm[0] = 0.0
+
+        for i in range(1, n):
+            tr[i] = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            up_move = highs[i] - highs[i - 1]
+            down_move = lows[i - 1] - lows[i]
+            plus_dm[i] = up_move if up_move > down_move and up_move > 0 else 0.0
+            minus_dm[i] = down_move if down_move > up_move and down_move > 0 else 0.0
+
+        # Smoothed TR, +DM, -DM using Wilder's method
+        atr_s = np.mean(tr[1 : period + 1])
+        plus_dm_s = np.mean(plus_dm[1 : period + 1])
+        minus_dm_s = np.mean(minus_dm[1 : period + 1])
+
+        dx_vals = []
+        for i in range(period + 1, n):
+            atr_s = atr_s - (atr_s / period) + tr[i]
+            plus_dm_s = plus_dm_s - (plus_dm_s / period) + plus_dm[i]
+            minus_dm_s = minus_dm_s - (minus_dm_s / period) + minus_dm[i]
+
+            plus_di = 100 * plus_dm_s / atr_s if atr_s > 0 else 0
+            minus_di = 100 * minus_dm_s / atr_s if atr_s > 0 else 0
+            di_sum = plus_di + minus_di
+            dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
+            dx_vals.append((i, dx))
+
+        # ADX = smoothed DX over `period`
+        if len(dx_vals) >= period:
+            adx_val = np.mean([d[1] for d in dx_vals[:period]])
+            adx_out[dx_vals[period - 1][0]] = adx_val
+            for j in range(period, len(dx_vals)):
+                adx_val = (adx_val * (period - 1) + dx_vals[j][1]) / period
+                adx_out[dx_vals[j][0]] = adx_val
+
+        return adx_out
+
+    @staticmethod
     def vwap(candles: list[Candle]) -> np.ndarray:
         """Volume Weighted Average Price (cumulative from start of candle list)."""
         typical_prices = np.array([(c.high + c.low + c.close) / 3.0 for c in candles])
@@ -166,6 +227,7 @@ class TechnicalIndicators:
             closes, macd_fast, macd_slow, macd_signal
         )
         atr_vals = ti.atr(candles, atr_period)
+        adx_vals = ti.adx(candles, atr_period)
         vwap_vals = ti.vwap(candles)
         vol_sma = ti.volume_sma(candles, vol_sma_period)
 
@@ -185,6 +247,7 @@ class TechnicalIndicators:
             "macd_histogram": histogram[-1],
             "macd_histogram_prev": histogram[-2],
             "atr": atr_vals[-1],
+            "adx": adx_vals[-1] if not np.isnan(adx_vals[-1]) else 0.0,
             "vwap": vwap_vals[-1],
             "volume": current_volume,
             "volume_sma": avg_volume,

@@ -48,8 +48,11 @@ class MomentumStrategy:
         self.rsi_buy_max: float = config.get("rsi_buy_max", 75.0)
         self.rsi_sell_min: float = config.get("rsi_sell_min", 25.0)
         self.rsi_sell_max: float = config.get("rsi_sell_max", 50.0)
-        self.volume_threshold: float = config.get("volume_threshold", 1.3)
-        self.min_confidence: float = config.get("min_confidence", 0.6)
+        self.volume_threshold: float = config.get("volume_threshold", 1.5)
+        self.min_confidence: float = config.get("min_confidence", 0.8)
+
+        # ADX trend filter — only enter if trend is strong enough
+        self.adx_trend_threshold: float = config.get("adx_trend_threshold", 25.0)
 
         # Exit thresholds
         self.rsi_exit_long_below: float = config.get("rsi_exit_long_below", 45.0)
@@ -92,6 +95,11 @@ class MomentumStrategy:
             exit_signal = self._check_exit_short(indicators)
             if exit_signal:
                 return exit_signal
+
+        # ADX trend filter — skip entries in choppy/ranging markets
+        adx = indicators.get("adx", 0)
+        if adx < self.adx_trend_threshold:
+            return SignalResult(Signal.HOLD, 0.0, [f"ADX too low ({adx:.1f} < {self.adx_trend_threshold}) — no trend"])
 
         # Score buy conditions
         buy_score, buy_reasons = self._score_buy(indicators)
@@ -191,7 +199,7 @@ class MomentumStrategy:
     def _check_exit_long(self, ind: dict) -> SignalResult | None:
         """Check if we should exit a long position.
 
-        Requires at least 2 confirming conditions to avoid premature exits
+        Requires all 3 confirming conditions to avoid premature exits
         from momentary noise (e.g. a single bad MACD bar).
         """
         reasons = []
@@ -203,14 +211,14 @@ class MomentumStrategy:
         if ind["macd_histogram"] < 0 and ind["macd_histogram"] < ind["macd_histogram_prev"]:
             reasons.append("MACD histogram turned negative & decreasing")
 
-        if len(reasons) >= 2:
-            return SignalResult(Signal.CLOSE_LONG, 0.8, reasons)
+        if len(reasons) >= 3:
+            return SignalResult(Signal.CLOSE_LONG, 0.9, reasons)
         return None
 
     def _check_exit_short(self, ind: dict) -> SignalResult | None:
         """Check if we should exit a short position.
 
-        Requires at least 2 confirming conditions to avoid premature exits
+        Requires all 3 confirming conditions to avoid premature exits
         from momentary noise.
         """
         reasons = []
@@ -222,6 +230,6 @@ class MomentumStrategy:
         if ind["macd_histogram"] > 0 and ind["macd_histogram"] > ind["macd_histogram_prev"]:
             reasons.append("MACD histogram turned positive & increasing")
 
-        if len(reasons) >= 2:
-            return SignalResult(Signal.CLOSE_SHORT, 0.8, reasons)
+        if len(reasons) >= 3:
+            return SignalResult(Signal.CLOSE_SHORT, 0.9, reasons)
         return None

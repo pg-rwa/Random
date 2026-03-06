@@ -197,6 +197,9 @@ class TradeExecutor:
         stop_price = self.risk.calculate_stop_loss(current_price, atr, side)
         take_profit = self.risk.calculate_take_profit(current_price, atr, side)
         size = self.risk.calculate_position_size(equity, current_price, stop_price)
+        # Scale position size by confidence — risk less on weaker signals
+        confidence_scale = signal.confidence / 0.80  # 1.0x at min threshold, >1x for stronger
+        size = size * min(confidence_scale, 1.25)  # Cap at 1.25x to avoid over-sizing
 
         if size <= 0:
             logger.warning("Calculated position size is 0. Skipping.")
