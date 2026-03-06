@@ -112,8 +112,20 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
     exchange = HyperliquidExchange(secret_key, wallet, testnet=testnet)
 
     # Load strategy & executor config
-    symbol = config.get("symbol", "XAU")
+    configured_symbol = config.get("symbol", "XAU")
     interval = config.get("interval", "1m")
+
+    # Auto-discover gold symbol — HIP-3 assets may have different names
+    search_terms = ["XAU", "GOLD", configured_symbol]
+    discovered = exchange.discover_symbol(search_terms)
+    if discovered:
+        symbol = discovered
+        logger.info("Gold symbol discovered: '%s' (configured: '%s')", symbol, configured_symbol)
+    else:
+        symbol = configured_symbol
+        logger.warning("Could not auto-discover gold symbol, using configured: '%s'", symbol)
+        logger.warning("Available coins in SDK: %s",
+                        list(exchange._info.name_to_coin.keys())[:50])
     candle_limit = config.get("candle_limit", 100)
     loop_interval = config.get("loop_interval_seconds", 60)
     leverage = config.get("leverage", 10)

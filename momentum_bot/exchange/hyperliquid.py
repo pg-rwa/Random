@@ -36,6 +36,8 @@ class HyperliquidExchange(ExchangeBase):
         # Lazy-initialized to avoid network calls during construction
         self.__info: Optional[Info] = None
         self.__exchange: Optional[Exchange] = None
+        # Cache of dex names for allMids queries
+        self._perp_dex_names: list[str] = [""]
         logger.info(
             "Hyperliquid exchange initialized (testnet=%s, wallet=%s...%s)",
             testnet,
@@ -54,9 +56,10 @@ class HyperliquidExchange(ExchangeBase):
                     timeout=10,
                 )
                 dex_list = resp.json()
-                perp_dex_names = [""] + [d["name"] for d in dex_list]
-                logger.info("Loading perp DEXes: %s", perp_dex_names)
-                self.__info = Info(self._base_url, skip_ws=True, perp_dexs=perp_dex_names)
+                self._perp_dex_names = [""] + [d["name"] for d in dex_list]
+                logger.info("Loading perp DEXes: %s", self._perp_dex_names)
+                self.__info = Info(self._base_url, skip_ws=True, perp_dexs=self._perp_dex_names)
+                logger.info("SDK name_to_coin has %d entries", len(self.__info.name_to_coin))
             except Exception as e:
                 logger.warning("Failed to load builder DEXes, using default: %s", e)
                 self.__info = Info(self._base_url, skip_ws=True)
@@ -77,7 +80,13 @@ class HyperliquidExchange(ExchangeBase):
     ) -> list[Candle]:
         hl_interval = INTERVAL_MAP.get(interval, interval)
         end_time = int(time.time() * 1000)
-        start_time = end_time - limit * 60 * 1000  # rough estimate
+        # Calculate start_time based on interval
+        interval_ms = {
+            "1m": 60_000, "5m": 300_000, "15m": 900_000,
+            "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+        }
+        ms_per_candle = interval_ms.get(hl_interval, 60_000)
+        start_time = end_time - limit * ms_per_candle
 
         try:
             raw = self._info.candles_snapshot(symbol, hl_interval, start_time, end_time)
@@ -119,10 +128,56 @@ class HyperliquidExchange(ExchangeBase):
         return resp.json()
 
     async def get_price(self, symbol: str) -> float:
-        all_mids = self._info.all_mids()
-        if symbol in all_mids:
-            return float(all_mids[symbol])
+        # Try each perp dex for the symbol's mid price
+        for dex in self._perp_dex_names:
+            try:
+                all_mids = self._info.all_mids(dex=dex)
+                if symbol in all_mids:
+                    return float(all_mids[symbol])
+            except Exception:
+                continue
         raise ValueError(f"Symbol {symbol} not found on Hyperliquid")
+
+    def discover_symbol(self, search_terms: list[str]) -> Optional[str]:
+        """Search all loaded perp assets for a symbol matching any of the search terms.
+
+        Returns the exact coin name as known to the SDK, or None.
+        Useful for HIP-3 assets where the name might differ from expected (e.g., GOLD vs XAU).
+        """
+        # First check name_to_coin mapping (loaded from all dexes)
+        info = self._info
+        search_upper = [t.upper() for t in search_terms]
+
+        # Exact match first
+        for name in info.name_to_coin:
+            if name.upper() in search_upper:
+                logger.info("Symbol discovery: exact match '%s' in name_to_coin", name)
+                return name
+
+        # Partial match (e.g., search "GOLD" matches "xyz:GOLD")
+        for name in info.name_to_coin:
+            for term in search_upper:
+                if term in name.upper():
+                    logger.info("Symbol discovery: partial match '%s' for search '%s'", name, term)
+                    return name
+
+        # Also search allMids across all dexes
+        for dex in self._perp_dex_names:
+            try:
+                all_mids = info.all_mids(dex=dex)
+                for coin in all_mids:
+                    if coin.upper() in search_upper:
+                        logger.info("Symbol discovery: found '%s' in allMids (dex='%s')", coin, dex)
+                        return coin
+                    for term in search_upper:
+                        if term in coin.upper():
+                            logger.info("Symbol discovery: partial '%s' in allMids (dex='%s')", coin, dex)
+                            return coin
+            except Exception:
+                continue
+
+        logger.warning("Symbol discovery: no match for %s", search_terms)
+        return None
 
     async def place_order(
         self,
