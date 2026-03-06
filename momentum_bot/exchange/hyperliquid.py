@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Optional
 
+import requests
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
@@ -45,7 +46,20 @@ class HyperliquidExchange(ExchangeBase):
     @property
     def _info(self) -> Info:
         if self.__info is None:
-            self.__info = Info(self._base_url, skip_ws=True)
+            # Load all builder perp DEXes so HIP-3 assets (XAU, XAG, etc.) are available
+            try:
+                resp = requests.post(
+                    self._base_url + "/info",
+                    json={"type": "perpDexs"},
+                    timeout=10,
+                )
+                dex_list = resp.json()
+                perp_dex_names = [""] + [d["name"] for d in dex_list]
+                logger.info("Loading perp DEXes: %s", perp_dex_names)
+                self.__info = Info(self._base_url, skip_ws=True, perp_dexs=perp_dex_names)
+            except Exception as e:
+                logger.warning("Failed to load builder DEXes, using default: %s", e)
+                self.__info = Info(self._base_url, skip_ws=True)
         return self.__info
 
     @property
@@ -62,10 +76,15 @@ class HyperliquidExchange(ExchangeBase):
         self, symbol: str, interval: str, limit: int = 100
     ) -> list[Candle]:
         hl_interval = INTERVAL_MAP.get(interval, interval)
+        end_time = int(time.time() * 1000)
+        start_time = end_time - limit * 60 * 1000  # rough estimate
 
-        # Hyperliquid SDK uses synchronous calls
-        end_time = int(time.time() * 1000)  # current time in ms
-        raw = self._info.candles_snapshot(symbol, hl_interval, limit, end_time)
+        try:
+            raw = self._info.candles_snapshot(symbol, hl_interval, start_time, end_time)
+        except KeyError:
+            # Symbol not in SDK's name_to_coin — use direct API call (HIP-3 assets)
+            logger.info("Symbol %s not in SDK mapping, using direct API", symbol)
+            raw = self._candles_direct(symbol, hl_interval, start_time, end_time)
 
         candles = []
         for c in raw:
@@ -80,6 +99,24 @@ class HyperliquidExchange(ExchangeBase):
                 )
             )
         return candles
+
+    def _candles_direct(self, coin: str, interval: str, start_time: int, end_time: int) -> list:
+        """Fetch candles via direct API POST for assets not in SDK mapping."""
+        resp = requests.post(
+            self._base_url + "/info",
+            json={
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": coin,
+                    "interval": interval,
+                    "startTime": start_time,
+                    "endTime": end_time,
+                },
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     async def get_price(self, symbol: str) -> float:
         all_mids = self._info.all_mids()
