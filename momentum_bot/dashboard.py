@@ -245,7 +245,7 @@ async function refresh() {
         <td><strong>${t.symbol || '--'}</strong></td>
         <td>${badgeFor(t.signal || '--')}</td>
         <td>${badgeFor(t.side || '--')}</td>
-        <td>$${fmt(t.entry_price || t.close_price)}</td>
+        <td>$${fmt(t.side === 'close' ? t.close_price : t.entry_price)}</td>
         <td>${fmt(t.size, 4)}</td>
         <td>${confBar(t.confidence)}</td>
         <td class="${pnlClass(t.pnl)}">${t.pnl != null ? '$'+fmt(t.pnl) : '--'}</td>
