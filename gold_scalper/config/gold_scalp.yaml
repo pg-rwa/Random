@@ -1,0 +1,32 @@
+# Gold Scalper Configuration
+# Bollinger Band mean-reversion strategy on 1m candles
+# Designed for micro-trades with quick profit taking
+
+symbol: GOLD
+interval: "1m"
+candle_limit: 100
+loop_interval_seconds: 60
+leverage: 10
+
+# Strategy parameters (Bollinger Band + RSI)
+strategy:
+  bb_period: 20
+  bb_std: 2.0
+  rsi_period: 14
+  rsi_oversold: 35.0
+  rsi_overbought: 65.0
+  rsi_exit_long: 55.0      # Close long when RSI rises above this
+  rsi_exit_short: 45.0     # Close short when RSI drops below this
+  band_touch_pct: 0.15     # Entry trigger: price within 15% of band width from band
+  use_trend_filter: false   # Disabled — we trade both directions in any trend
+  ema_fast: 9
+  ema_slow: 21
+
+# Executor parameters (trade sizing & risk)
+executor:
+  tp_pct: 0.12              # Take profit: 0.12% (quick scalp)
+  sl_pct: 0.18              # Stop loss: 0.18% (tight risk)
+  position_size_usd: 100.0  # Base margin per trade ($100 × 10x = $1000 notional)
+  max_consecutive_losses: 5  # Pause after 5 losses in a row
+  cooldown_after_losses_sec: 300  # 5 min cooldown after loss streak
+  daily_loss_limit_pct: 3.0  # Stop trading if down 3% of equity for the day
