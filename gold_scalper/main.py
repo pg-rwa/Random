@@ -112,7 +112,7 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
     exchange = HyperliquidExchange(secret_key, wallet, testnet=testnet)
 
     # Load strategy & executor config
-    symbol = config.get("symbol", "GOLD")
+    symbol = config.get("symbol", "XAU")
     interval = config.get("interval", "1m")
     candle_limit = config.get("candle_limit", 100)
     loop_interval = config.get("loop_interval_seconds", 60)

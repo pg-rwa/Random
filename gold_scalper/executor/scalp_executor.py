@@ -140,7 +140,7 @@ class ScalpExecutor:
 
         trade_record = {
             "timestamp": time.time(),
-            "symbol": "GOLD",
+            "symbol": "XAU",
             "direction": direction,
             "signal": reason,
             "side": "close",
@@ -182,7 +182,7 @@ class ScalpExecutor:
         return trade_record
 
     async def execute_signals(
-        self, signals: ScalpResult, current_price: float, symbol: str = "GOLD"
+        self, signals: ScalpResult, current_price: float, symbol: str = "XAU"
     ) -> list[dict]:
         """Process scalp signals. Can execute multiple actions per cycle."""
         executed = []
