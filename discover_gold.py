@@ -7,10 +7,23 @@ BASE = "https://api.hyperliquid.xyz"
 
 print("=== Step 1: Get all builder perp DEXes ===")
 resp = requests.post(f"{BASE}/info", json={"type": "perpDexs"}, timeout=10)
-dexes = resp.json()
-print(f"Found {len(dexes)} builder DEXes:")
-for d in dexes:
-    print(f"  - {d['name']}")
+raw_dexes = resp.json()
+print(f"Raw perpDexs response ({len(raw_dexes)} entries):")
+for i, d in enumerate(raw_dexes):
+    print(f"  [{i}] {json.dumps(d)}")
+
+# Filter to valid dex entries
+dexes = []
+for d in raw_dexes:
+    if d is None:
+        continue
+    if isinstance(d, dict) and "name" in d:
+        dexes.append(d)
+    elif isinstance(d, str):
+        dexes.append({"name": d})
+    else:
+        print(f"  Unknown dex format: {type(d)} = {d}")
+print(f"\nValid DEXes: {[d['name'] for d in dexes]}")
 
 print("\n=== Step 2: Get meta (universe) for each DEX ===")
 all_coins = {}
