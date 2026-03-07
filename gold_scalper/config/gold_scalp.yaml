@@ -2,7 +2,7 @@
 # Bollinger Band mean-reversion strategy on 1m candles
 # Designed for micro-trades with quick profit taking
 
-symbol: XAU
+symbol: "xyz:GOLD"
 interval: "1m"
 candle_limit: 100
 loop_interval_seconds: 60

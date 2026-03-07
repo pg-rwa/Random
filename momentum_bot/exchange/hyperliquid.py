@@ -56,7 +56,11 @@ class HyperliquidExchange(ExchangeBase):
                     timeout=10,
                 )
                 dex_list = resp.json()
-                self._perp_dex_names = [""] + [d["name"] for d in dex_list]
+                # Filter out None entries in perpDexs response
+                self._perp_dex_names = [""] + [
+                    d["name"] for d in dex_list
+                    if d is not None and isinstance(d, dict) and "name" in d
+                ]
                 logger.info("Loading perp DEXes: %s", self._perp_dex_names)
                 self.__info = Info(self._base_url, skip_ws=True, perp_dexs=self._perp_dex_names)
                 logger.info("SDK name_to_coin has %d entries", len(self.__info.name_to_coin))
