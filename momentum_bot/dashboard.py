@@ -68,6 +68,64 @@ def _load_gold_trades(days: int = 7) -> list[dict]:
     return trades
 
 
+def _derive_paper_positions(momentum_trades: list[dict], gold_trades: list[dict]) -> list[dict]:
+    """Derive open paper positions from trade logs (for paper mode display)."""
+    positions = []
+
+    # Momentum: group by symbol, check if last trade is an open (status=filled, side!=close)
+    symbol_last: dict[str, dict] = {}
+    for t in sorted(momentum_trades, key=lambda x: x.get("timestamp", 0)):
+        sym = t.get("symbol", "")
+        if not sym:
+            continue
+        if t.get("status") == "closed" or t.get("side") == "close":
+            symbol_last.pop(sym, None)
+        elif t.get("status") == "filled" and t.get("side") in ("buy", "sell"):
+            symbol_last[sym] = t
+
+    for sym, t in symbol_last.items():
+        positions.append({
+            "symbol": sym,
+            "size": t.get("size", 0),
+            "side": "LONG" if t.get("side") == "buy" else "SHORT",
+            "entry_price": t.get("entry_price", 0),
+            "mark_price": 0,
+            "unrealized_pnl": 0,
+            "leverage": "3",
+            "stop_loss": t.get("stop_loss", 0),
+            "take_profit": t.get("take_profit", 0),
+            "source": "paper",
+        })
+
+    # Gold: group by direction (long/short), check if last trade per direction is open
+    for direction in ("long", "short"):
+        last_open = None
+        for t in sorted(gold_trades, key=lambda x: x.get("timestamp", 0)):
+            d = t.get("direction", t.get("side", ""))
+            if d != direction and t.get("side") != "close":
+                continue
+            if t.get("side") == "close" and t.get("direction") == direction:
+                last_open = None
+            elif t.get("status") == "filled" and d == direction:
+                last_open = t
+
+        if last_open:
+            positions.append({
+                "symbol": "GOLD",
+                "size": last_open.get("size", 0),
+                "side": direction.upper(),
+                "entry_price": last_open.get("entry_price", 0),
+                "mark_price": 0,
+                "unrealized_pnl": 0,
+                "leverage": "10",
+                "stop_loss": last_open.get("stop_loss", 0),
+                "take_profit": last_open.get("take_profit", 0),
+                "source": "paper",
+            })
+
+    return positions
+
+
 async def handle_index(request: web.Request) -> web.Response:
     return web.Response(text=HTML_PAGE, content_type="text/html")
 
@@ -143,6 +201,12 @@ async def handle_api_status(request: web.Request) -> web.Response:
         },
     }
 
+    # Add paper positions if no exchange positions detected
+    if not data["positions"]:
+        paper_pos = _derive_paper_positions(trades, gold_trades)
+        if paper_pos:
+            data["positions"] = paper_pos
+
     return web.json_response(data)
 
 
@@ -210,16 +274,36 @@ HTML_PAGE = """<!DOCTYPE html>
   <span style="margin-left:auto" id="lastUpdate"></span>
 </div>
 
+<!-- ===== PNL SUMMARY (TOP) ===== -->
+<div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-bottom: 16px;">
+  <div class="card" style="border-left: 3px solid #58a6ff;">
+    <div class="label">BTC Momentum PnL</div>
+    <div class="value" id="topMomentumPnl">--</div>
+    <div style="margin-top:8px; font-size:0.8em; color:#8b949e;">
+      <span id="topMomWinRate">--</span> win rate &bull; <span id="topMomTrades">0</span> trades &bull;
+      <span class="positive" id="topMomWins">0</span>W / <span class="negative" id="topMomLosses">0</span>L
+    </div>
+  </div>
+  <div class="card" style="border-left: 3px solid #d29922;">
+    <div class="label">Gold Scalper PnL</div>
+    <div class="value" id="topGoldPnl">--</div>
+    <div style="margin-top:8px; font-size:0.8em; color:#8b949e;">
+      <span id="topGoldWinRate">--</span> win rate &bull; <span id="topGoldTrades">0</span> trades &bull;
+      <span class="positive" id="topGoldWins">0</span>W / <span class="negative" id="topGoldLosses">0</span>L
+    </div>
+  </div>
+</div>
+
 <!-- ===== ACCOUNT OVERVIEW ===== -->
 <div class="grid">
   <div class="card"><div class="label">Account Balance</div><div class="value" id="balance">--</div></div>
   <div class="card"><div class="label">Combined PnL</div><div class="value" id="combinedPnl">--</div></div>
 </div>
 
-<h2>Open Positions (Exchange)</h2>
+<h2>Open Positions</h2>
 <table>
-  <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>uPnL</th><th>Leverage</th></tr></thead>
-  <tbody id="positionsBody"><tr><td colspan="6" class="empty">No open positions</td></tr></tbody>
+  <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>SL / TP</th><th>uPnL</th><th>Lev</th><th>Mode</th></tr></thead>
+  <tbody id="positionsBody"><tr><td colspan="8" class="empty">No open positions</td></tr></tbody>
 </table>
 
 <!-- ===== MOMENTUM BOT SECTION ===== -->
@@ -317,6 +401,19 @@ async function refresh() {
     const combinedPnl = (s.total_pnl || 0) + (g.total_pnl || 0);
     $('combinedPnl').innerHTML = `<span class="${pnlClass(combinedPnl)}">$${fmt(combinedPnl)}</span>`;
 
+    // ===== TOP PNL SUMMARY =====
+    $('topMomentumPnl').innerHTML = `<span class="${pnlClass(s.total_pnl)}">$${fmt(s.total_pnl)}</span>`;
+    $('topMomWinRate').textContent = fmt(s.win_rate,1) + '%';
+    $('topMomTrades').textContent = s.closed || 0;
+    $('topMomWins').textContent = s.wins || 0;
+    $('topMomLosses').textContent = s.losses || 0;
+
+    $('topGoldPnl').innerHTML = `<span class="${pnlClass(g.total_pnl)}">$${fmt(g.total_pnl)}</span>`;
+    $('topGoldWinRate').textContent = fmt(g.win_rate,1) + '%';
+    $('topGoldTrades').textContent = g.closed || 0;
+    $('topGoldWins').textContent = g.wins || 0;
+    $('topGoldLosses').textContent = g.losses || 0;
+
     // ===== MOMENTUM BOT =====
     $('totalPnl').innerHTML = `<span class="${pnlClass(s.total_pnl)}">$${fmt(s.total_pnl)}</span>`;
     $('winRate').innerHTML = `<span class="${s.win_rate >= 50 ? 'positive' : s.win_rate > 0 ? 'negative' : 'neutral'}">${fmt(s.win_rate,1)}%</span>`;
@@ -324,19 +421,25 @@ async function refresh() {
     $('winLoss').innerHTML = `<span class="positive">${s.wins||0}</span> / <span class="negative">${s.losses||0}</span>`;
     $('avgWinLoss').innerHTML = `<span class="positive">$${fmt(s.avg_win)}</span> / <span class="negative">$${fmt(s.avg_loss)}</span>`;
 
-    // Positions
+    // Positions (exchange + paper)
     const pb = $('positionsBody');
     if (d.positions && d.positions.length) {
-      pb.innerHTML = d.positions.map(p => `<tr>
+      pb.innerHTML = d.positions.map(p => {
+        const isPaper = p.source === 'paper';
+        const slTp = p.stop_loss ? `$${fmt(p.stop_loss)} / $${fmt(p.take_profit)}` : '--';
+        return `<tr>
         <td><strong>${p.symbol}</strong></td>
         <td>${badgeFor(p.side)}</td>
         <td>${fmt(Math.abs(p.size), 4)}</td>
         <td>$${fmt(p.entry_price)}</td>
+        <td style="font-size:0.85em">${slTp}</td>
         <td class="${pnlClass(p.unrealized_pnl)}">$${fmt(p.unrealized_pnl)}</td>
         <td>${p.leverage}x</td>
-      </tr>`).join('');
+        <td>${isPaper ? badgeFor('paper') : badgeFor('live')}</td>
+      </tr>`;
+      }).join('');
     } else {
-      pb.innerHTML = '<tr><td colspan="6" class="empty">No open positions</td></tr>';
+      pb.innerHTML = '<tr><td colspan="8" class="empty">No open positions</td></tr>';
     }
 
     // Momentum trades
