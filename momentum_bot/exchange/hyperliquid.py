@@ -144,39 +144,50 @@ class HyperliquidExchange(ExchangeBase):
         Returns the exact coin name as known to the SDK, or None.
         Useful for HIP-3 assets where the name might differ from expected (e.g., GOLD vs XAU).
         """
-        # First check name_to_coin mapping (loaded from all dexes)
         info = self._info
         search_upper = [t.upper() for t in search_terms]
 
-        # Exact match first
+        def _is_perp_name(name: str) -> bool:
+            """Filter out spot pairs (contain '/') — we only want perp coins."""
+            return "/" not in name
+
+        # Pass 1: Exact match in name_to_coin (perps only)
         for name in info.name_to_coin:
-            if name.upper() in search_upper:
+            if _is_perp_name(name) and name.upper() in search_upper:
                 logger.info("Symbol discovery: exact match '%s' in name_to_coin", name)
                 return name
 
-        # Partial match (e.g., search "GOLD" matches "xyz:GOLD")
+        # Pass 2: Exact match after dex prefix (e.g., "xyz:GOLD" matches search "GOLD")
         for name in info.name_to_coin:
-            for term in search_upper:
-                if term in name.upper():
-                    logger.info("Symbol discovery: partial match '%s' for search '%s'", name, term)
-                    return name
+            if not _is_perp_name(name):
+                continue
+            # Strip dex prefix for matching: "xyz:GOLD" -> "GOLD"
+            coin_part = name.split(":")[-1].upper() if ":" in name else name.upper()
+            if coin_part in search_upper:
+                logger.info("Symbol discovery: prefix match '%s' (coin=%s)", name, coin_part)
+                return name
 
-        # Also search allMids across all dexes
+        # Pass 3: Search allMids across all dexes (exact then prefix match)
         for dex in self._perp_dex_names:
             try:
                 all_mids = info.all_mids(dex=dex)
                 for coin in all_mids:
+                    if not _is_perp_name(coin):
+                        continue
                     if coin.upper() in search_upper:
                         logger.info("Symbol discovery: found '%s' in allMids (dex='%s')", coin, dex)
                         return coin
-                    for term in search_upper:
-                        if term in coin.upper():
-                            logger.info("Symbol discovery: partial '%s' in allMids (dex='%s')", coin, dex)
-                            return coin
+                    coin_part = coin.split(":")[-1].upper() if ":" in coin else coin.upper()
+                    if coin_part in search_upper:
+                        logger.info("Symbol discovery: prefix match '%s' in allMids (dex='%s')", coin, dex)
+                        return coin
             except Exception:
                 continue
 
-        logger.warning("Symbol discovery: no match for %s", search_terms)
+        # Log available perp coins for debugging
+        perp_coins = [n for n in info.name_to_coin if _is_perp_name(n)]
+        logger.warning("Symbol discovery: no match for %s in %d perp coins", search_terms, len(perp_coins))
+        logger.warning("Sample perp coins: %s", perp_coins[:30])
         return None
 
     async def place_order(

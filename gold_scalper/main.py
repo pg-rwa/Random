@@ -116,7 +116,8 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
     interval = config.get("interval", "1m")
 
     # Auto-discover gold symbol — HIP-3 assets may have different names
-    search_terms = ["XAU", "GOLD", configured_symbol]
+    # Try multiple possible names: XAU (standard), GOLD, @GOLD (hyperp prefix)
+    search_terms = list(set(["XAU", "GOLD", "@GOLD", "@XAU", configured_symbol]))
     discovered = exchange.discover_symbol(search_terms)
     if discovered:
         symbol = discovered
