@@ -25,13 +25,14 @@ class ScalpExecutor:
         self,
         exchange: ExchangeBase,
         paper_trade: bool = True,
-        tp_pct: float = 0.12,
-        sl_pct: float = 0.18,
+        tp_pct: float = 0.14,
+        sl_pct: float = 0.14,
         position_size_usd: float = 100.0,
         leverage: int = 10,
         max_consecutive_losses: int = 5,
         cooldown_after_losses_sec: int = 300,
         daily_loss_limit_pct: float = 3.0,
+        direction_cooldown_sec: float = 120.0,
         log_dir: str = "gold_trades",
     ):
         self.exchange = exchange
@@ -59,10 +60,10 @@ class ScalpExecutor:
         self._daily_start_equity: float = 10000.0
         self._day_start: float = time.time()
 
-        # Minimal cooldown per direction (prevent re-opening same second)
+        # Cooldown per direction — prevents re-entering same direction too fast after close/SL
         self._last_long_close: float = 0.0
         self._last_short_close: float = 0.0
-        self._direction_cooldown: float = 15.0  # 15 seconds between same-direction trades
+        self._direction_cooldown: float = direction_cooldown_sec
 
         mode = "PAPER" if paper_trade else "LIVE"
         logger.info("ScalpExecutor initialized in %s mode | TP=%.2f%% SL=%.2f%% | Size=$%.0f | Leverage=%dx",

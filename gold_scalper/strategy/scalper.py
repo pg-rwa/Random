@@ -52,6 +52,8 @@ class BollingerScalper:
         self.rsi_exit_short: float = config.get("rsi_exit_short", 45.0)
         # How close to the band (as % of band width) to trigger entry
         self.band_touch_pct: float = config.get("band_touch_pct", 0.15)
+        # Minimum BB width (%) to allow entries — below this, bands are too tight (breakout zone)
+        self.min_bb_width_pct: float = config.get("min_bb_width_pct", 0.25)
         # Use EMA trend filter — only long in uptrend, short in downtrend, or both in range
         self.use_trend_filter: bool = config.get("use_trend_filter", False)
 
@@ -115,6 +117,14 @@ class BollingerScalper:
                 result.reasons.append(f"Short exit: RSI {rsi:.1f} <= {self.rsi_exit_short}")
 
         # --- ENTRY LOGIC ---
+
+        # Skip entries when BB width is too narrow (breakout zone, not mean reversion)
+        bb_width_pct = band_width / bb_middle * 100 if bb_middle > 0 else 0
+        if bb_width_pct < self.min_bb_width_pct:
+            if not result.signals:
+                result.signals.append(ScalpSignal.HOLD)
+                result.reasons.append(f"BB width {bb_width_pct:.2f}% < {self.min_bb_width_pct}% min")
+            return result
 
         # Open long: price near/below lower band + RSI oversold
         if not has_long and dist_to_lower <= self.band_touch_pct:

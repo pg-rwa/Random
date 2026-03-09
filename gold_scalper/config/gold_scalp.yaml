@@ -13,20 +13,22 @@ strategy:
   bb_period: 20
   bb_std: 2.0
   rsi_period: 14
-  rsi_oversold: 35.0
-  rsi_overbought: 65.0
-  rsi_exit_long: 55.0      # Close long when RSI rises above this
-  rsi_exit_short: 45.0     # Close short when RSI drops below this
-  band_touch_pct: 0.15     # Entry trigger: price within 15% of band width from band
-  use_trend_filter: false   # Disabled — we trade both directions in any trend
+  rsi_oversold: 30.0        # Tightened from 35 — only enter on strong oversold
+  rsi_overbought: 70.0      # Tightened from 65 — only enter on strong overbought
+  rsi_exit_long: 55.0       # Close long when RSI rises above this
+  rsi_exit_short: 45.0      # Close short when RSI drops below this
+  band_touch_pct: 0.15      # Entry trigger: price within 15% of band width from band
+  min_bb_width_pct: 0.25    # Skip entries when BB width < 0.25% (breakout zone, not mean reversion)
+  use_trend_filter: false    # Disabled — we trade both directions in any trend
   ema_fast: 9
   ema_slow: 21
 
 # Executor parameters (trade sizing & risk)
 executor:
-  tp_pct: 0.12              # Take profit: 0.12% (quick scalp)
-  sl_pct: 0.18              # Stop loss: 0.18% (tight risk)
+  tp_pct: 0.14              # Take profit: 0.14% (widened from 0.12% for better R:R)
+  sl_pct: 0.14              # Stop loss: 0.14% (tightened from 0.18% — equal R:R, cut losers faster)
   position_size_usd: 100.0  # Base margin per trade ($100 × 10x = $1000 notional)
   max_consecutive_losses: 5  # Pause after 5 losses in a row
   cooldown_after_losses_sec: 300  # 5 min cooldown after loss streak
   daily_loss_limit_pct: 3.0  # Stop trading if down 3% of equity for the day
+  direction_cooldown_sec: 120  # Wait 2 min before re-entering same direction (was 15s)

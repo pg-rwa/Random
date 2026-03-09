@@ -138,13 +138,14 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
     executor = ScalpExecutor(
         exchange=exchange,
         paper_trade=paper_trade,
-        tp_pct=executor_cfg.get("tp_pct", 0.12),
-        sl_pct=executor_cfg.get("sl_pct", 0.18),
+        tp_pct=executor_cfg.get("tp_pct", 0.14),
+        sl_pct=executor_cfg.get("sl_pct", 0.14),
         position_size_usd=executor_cfg.get("position_size_usd", 100.0),
         leverage=leverage,
         max_consecutive_losses=executor_cfg.get("max_consecutive_losses", 5),
         cooldown_after_losses_sec=executor_cfg.get("cooldown_after_losses_sec", 300),
         daily_loss_limit_pct=executor_cfg.get("daily_loss_limit_pct", 3.0),
+        direction_cooldown_sec=executor_cfg.get("direction_cooldown_sec", 120.0),
     )
 
     logger.info("=" * 60)
@@ -154,7 +155,7 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
     logger.info("  Interval: %s (scalp candles)", interval)
     logger.info("  Loop every: %ds", loop_interval)
     logger.info("  Leverage: %dx", leverage)
-    logger.info("  TP: %.2f%% | SL: %.2f%%", executor_cfg.get("tp_pct", 0.12), executor_cfg.get("sl_pct", 0.18))
+    logger.info("  TP: %.2f%% | SL: %.2f%%", executor_cfg.get("tp_pct", 0.14), executor_cfg.get("sl_pct", 0.14))
     logger.info("  Position size: $%.0f × %dx = $%.0f notional",
                 executor_cfg.get("position_size_usd", 100), leverage,
                 executor_cfg.get("position_size_usd", 100) * leverage)
