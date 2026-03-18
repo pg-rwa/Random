@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 TRADES_DIR = Path("trades")
 GOLD_TRADES_DIR = Path("gold_trades")
+BTC_TRADES_DIR = Path("btc_trades")
 WALLET = os.getenv("HL_WALLET_ADDRESS", "")
 TESTNET = os.getenv("HL_TESTNET", "true").lower() == "true"
 
@@ -68,7 +69,23 @@ def _load_gold_trades(days: int = 7) -> list[dict]:
     return trades
 
 
-def _derive_paper_positions(momentum_trades: list[dict], gold_trades: list[dict]) -> list[dict]:
+def _load_btc_trades(days: int = 7) -> list[dict]:
+    """Load BTC micro-trade logs from the last N days."""
+    trades = []
+    if not BTC_TRADES_DIR.exists():
+        return trades
+    files = sorted(BTC_TRADES_DIR.glob("btc_micro_*.json"), reverse=True)[:days]
+    for f in files:
+        try:
+            with open(f) as fh:
+                trades.extend(json.load(fh))
+        except (json.JSONDecodeError, IOError):
+            continue
+    trades.sort(key=lambda t: t.get("timestamp", 0), reverse=True)
+    return trades
+
+
+def _derive_paper_positions(momentum_trades: list[dict], gold_trades: list[dict], btc_trades: list[dict] | None = None) -> list[dict]:
     """Derive open paper positions from trade logs (for paper mode display)."""
     positions = []
 
@@ -122,6 +139,35 @@ def _derive_paper_positions(momentum_trades: list[dict], gold_trades: list[dict]
                 "take_profit": last_open.get("take_profit", 0),
                 "source": "paper",
             })
+
+    # BTC Micro: same dual-position logic as gold
+    if btc_trades:
+        for direction in ("long", "short"):
+            last_open = None
+            for t in sorted(btc_trades, key=lambda x: x.get("timestamp", 0)):
+                d = t.get("direction", t.get("side", ""))
+                if d != direction and t.get("side") != "close":
+                    continue
+                if t.get("side") == "close" and t.get("direction") == direction:
+                    last_open = None
+                elif t.get("status") == "closed" and t.get("direction") == direction:
+                    last_open = None
+                elif t.get("status") == "filled" and d == direction:
+                    last_open = t
+
+            if last_open:
+                positions.append({
+                    "symbol": "BTC (micro)",
+                    "size": last_open.get("size", 0),
+                    "side": direction.upper(),
+                    "entry_price": last_open.get("entry_price", 0),
+                    "mark_price": 0,
+                    "unrealized_pnl": 0,
+                    "leverage": "5",
+                    "stop_loss": last_open.get("stop_loss", 0),
+                    "take_profit": last_open.get("take_profit", 0),
+                    "source": "paper",
+                })
 
     return positions
 
@@ -201,9 +247,32 @@ async def handle_api_status(request: web.Request) -> web.Response:
         },
     }
 
+    # BTC Micro-Trading data
+    btc_trades = _load_btc_trades(days=7)
+    btc_closed = [t for t in btc_trades if "pnl" in t and t.get("status") == "closed"]
+    btc_pnls = [t["pnl"] for t in btc_closed]
+    btc_wins = [p for p in btc_pnls if p > 0]
+    btc_losses = [p for p in btc_pnls if p < 0]
+    btc_hold_times = [t.get("hold_time_sec", 0) for t in btc_closed if t.get("hold_time_sec")]
+
+    data["btc_micro"] = {
+        "trades": btc_trades[:50],
+        "summary": {
+            "total_trades": len(btc_trades),
+            "closed": len(btc_closed),
+            "total_pnl": round(sum(btc_pnls), 2),
+            "wins": len(btc_wins),
+            "losses": len(btc_losses),
+            "win_rate": round(len(btc_wins) / len(btc_pnls) * 100, 1) if btc_pnls else 0,
+            "avg_win": round(sum(btc_wins) / len(btc_wins), 2) if btc_wins else 0,
+            "avg_loss": round(sum(btc_losses) / len(btc_losses), 2) if btc_losses else 0,
+            "avg_hold_sec": round(sum(btc_hold_times) / len(btc_hold_times), 0) if btc_hold_times else 0,
+        },
+    }
+
     # Add paper positions if no exchange positions detected
     if not data["positions"]:
-        paper_pos = _derive_paper_positions(trades, gold_trades)
+        paper_pos = _derive_paper_positions(trades, gold_trades, btc_trades)
         if paper_pos:
             data["positions"] = paper_pos
 
@@ -263,6 +332,9 @@ HTML_PAGE = """<!DOCTYPE html>
   .gold-accent { color: #d29922; }
   .grid-gold .card { border-color: #3d3020; }
   .conf-fill-gold { background: #d29922; }
+  .btc-accent { color: #f0883e; }
+  .grid-btc .card { border-color: #3d2a1a; }
+  .tag-micro { background: #2a1c00; color: #f0883e; }
 </style>
 </head>
 <body>
@@ -275,13 +347,13 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 
 <!-- ===== PNL SUMMARY (TOP) ===== -->
-<div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-bottom: 16px;">
-  <div class="card" style="border-left: 3px solid #58a6ff;">
-    <div class="label">BTC Momentum PnL</div>
-    <div class="value" id="topMomentumPnl">--</div>
+<div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); margin-bottom: 16px;">
+  <div class="card" style="border-left: 3px solid #f0883e;">
+    <div class="label">BTC Micro PnL</div>
+    <div class="value" id="topBtcPnl">--</div>
     <div style="margin-top:8px; font-size:0.8em; color:#8b949e;">
-      <span id="topMomWinRate">--</span> win rate &bull; <span id="topMomTrades">0</span> trades &bull;
-      <span class="positive" id="topMomWins">0</span>W / <span class="negative" id="topMomLosses">0</span>L
+      <span id="topBtcWinRate">--</span> win rate &bull; <span id="topBtcTrades">0</span> trades &bull;
+      <span class="positive" id="topBtcWins">0</span>W / <span class="negative" id="topBtcLosses">0</span>L
     </div>
   </div>
   <div class="card" style="border-left: 3px solid #d29922;">
@@ -290,6 +362,14 @@ HTML_PAGE = """<!DOCTYPE html>
     <div style="margin-top:8px; font-size:0.8em; color:#8b949e;">
       <span id="topGoldWinRate">--</span> win rate &bull; <span id="topGoldTrades">0</span> trades &bull;
       <span class="positive" id="topGoldWins">0</span>W / <span class="negative" id="topGoldLosses">0</span>L
+    </div>
+  </div>
+  <div class="card" style="border-left: 3px solid #58a6ff;">
+    <div class="label">Momentum PnL</div>
+    <div class="value" id="topMomentumPnl">--</div>
+    <div style="margin-top:8px; font-size:0.8em; color:#8b949e;">
+      <span id="topMomWinRate">--</span> win rate &bull; <span id="topMomTrades">0</span> trades &bull;
+      <span class="positive" id="topMomWins">0</span>W / <span class="negative" id="topMomLosses">0</span>L
     </div>
   </div>
 </div>
@@ -306,10 +386,32 @@ HTML_PAGE = """<!DOCTYPE html>
   <tbody id="positionsBody"><tr><td colspan="8" class="empty">No open positions</td></tr></tbody>
 </table>
 
+<!-- ===== BTC MICRO-TRADING SECTION ===== -->
+<hr class="section-divider">
+<div class="section-header">
+  <h2 class="btc-accent">BTC Micro-Trading Bot</h2>
+  <span class="section-tag tag-micro">Micro &bull; 5X &bull; 1m &bull; Self-Learning</span>
+</div>
+
+<div class="grid grid-btc" id="btcSummaryCards">
+  <div class="card"><div class="label">BTC Micro PnL</div><div class="value" id="btcPnl">--</div></div>
+  <div class="card"><div class="label">Win Rate</div><div class="value" id="btcWinRate">--</div></div>
+  <div class="card"><div class="label">Trades</div><div class="value" id="btcTotalTrades">--</div></div>
+  <div class="card"><div class="label">Wins / Losses</div><div class="value" id="btcWinLoss">--</div></div>
+  <div class="card"><div class="label">Avg Win / Loss</div><div class="value" id="btcAvgWinLoss">--</div></div>
+  <div class="card"><div class="label">Avg Hold Time</div><div class="value" id="btcAvgHold">--</div></div>
+</div>
+
+<h2 class="btc-accent">BTC Micro Trades</h2>
+<table>
+  <thead><tr><th>Time</th><th>Direction</th><th>Signal</th><th>Entry</th><th>Exit</th><th>Size</th><th>Scores (L/S)</th><th>Hold</th><th>PnL</th></tr></thead>
+  <tbody id="btcTradesBody"><tr><td colspan="9" class="empty">No BTC micro trades yet</td></tr></tbody>
+</table>
+
 <!-- ===== MOMENTUM BOT SECTION ===== -->
 <hr class="section-divider">
 <div class="section-header">
-  <h2>BTC Momentum Bot</h2>
+  <h2>Momentum Bot</h2>
   <span class="section-tag tag-momentum">Momentum</span>
 </div>
 
@@ -391,6 +493,7 @@ async function refresh() {
     const d = await r.json();
     const s = d.summary || {};
     const g = (d.gold_scalper || {}).summary || {};
+    const b = (d.btc_micro || {}).summary || {};
 
     $('statusDot').className = 'dot dot-green';
     $('statusText').textContent = (d.testnet ? 'Testnet' : 'Mainnet') + ' \\u2022 ' + (d.wallet ? d.wallet.slice(0,6) + '...' + d.wallet.slice(-4) : 'No wallet');
@@ -398,10 +501,16 @@ async function refresh() {
 
     // Account overview
     $('balance').textContent = '$' + fmt(d.balance);
-    const combinedPnl = (s.total_pnl || 0) + (g.total_pnl || 0);
+    const combinedPnl = (s.total_pnl || 0) + (g.total_pnl || 0) + (b.total_pnl || 0);
     $('combinedPnl').innerHTML = `<span class="${pnlClass(combinedPnl)}">$${fmt(combinedPnl)}</span>`;
 
     // ===== TOP PNL SUMMARY =====
+    $('topBtcPnl').innerHTML = `<span class="${pnlClass(b.total_pnl)}">$${fmt(b.total_pnl)}</span>`;
+    $('topBtcWinRate').textContent = fmt(b.win_rate,1) + '%';
+    $('topBtcTrades').textContent = b.closed || 0;
+    $('topBtcWins').textContent = b.wins || 0;
+    $('topBtcLosses').textContent = b.losses || 0;
+
     $('topMomentumPnl').innerHTML = `<span class="${pnlClass(s.total_pnl)}">$${fmt(s.total_pnl)}</span>`;
     $('topMomWinRate').textContent = fmt(s.win_rate,1) + '%';
     $('topMomTrades').textContent = s.closed || 0;
@@ -485,6 +594,32 @@ async function refresh() {
       </tr>`).join('');
     } else {
       gt.innerHTML = '<tr><td colspan="9" class="empty">No gold trades yet</td></tr>';
+    }
+
+    // ===== BTC MICRO =====
+    $('btcPnl').innerHTML = `<span class="${pnlClass(b.total_pnl)}">$${fmt(b.total_pnl)}</span>`;
+    $('btcWinRate').innerHTML = `<span class="${b.win_rate >= 50 ? 'positive' : b.win_rate > 0 ? 'negative' : 'neutral'}">${fmt(b.win_rate,1)}%</span>`;
+    $('btcTotalTrades').textContent = b.total_trades || 0;
+    $('btcWinLoss').innerHTML = `<span class="positive">${b.wins||0}</span> / <span class="negative">${b.losses||0}</span>`;
+    $('btcAvgWinLoss').innerHTML = `<span class="positive">$${fmt(b.avg_win)}</span> / <span class="negative">$${fmt(b.avg_loss)}</span>`;
+    $('btcAvgHold').textContent = fmtHold(b.avg_hold_sec);
+
+    const bt = $('btcTradesBody');
+    const btcTrades = (d.btc_micro || {}).trades || [];
+    if (btcTrades.length) {
+      bt.innerHTML = btcTrades.map(t => `<tr>
+        <td>${fmtTime(t.timestamp)}</td>
+        <td>${badgeFor(t.direction || t.side || '--')}</td>
+        <td>${badgeFor(t.signal || '--')}</td>
+        <td>$${fmt(t.entry_price)}</td>
+        <td>${t.exit_price ? '$'+fmt(t.exit_price) : '--'}</td>
+        <td>${fmt(t.size, 6)}</td>
+        <td style="font-size:0.85em">${t.long_score != null ? 'L='+fmt(t.long_score,2)+' S='+fmt(t.short_score,2) : '--'}</td>
+        <td>${fmtHold(t.hold_time_sec)}</td>
+        <td class="${pnlClass(t.pnl)}">${t.pnl != null ? '$'+fmt(t.pnl) : '--'}</td>
+      </tr>`).join('');
+    } else {
+      bt.innerHTML = '<tr><td colspan="9" class="empty">No BTC micro trades yet</td></tr>';
     }
 
   } catch(e) {

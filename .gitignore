@@ -9,4 +9,5 @@ dist/
 logs/
 trades/
 gold_trades/
+btc_trades/
 *.log
