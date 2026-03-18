@@ -14,6 +14,7 @@ from pathlib import Path
 
 from momentum_bot.exchange.base import ExchangeBase, OrderSide
 from gold_scalper.strategy.scalper import ScalpSignal, ScalpResult
+from gold_scalper.learner.trade_learner import TradeLearner
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class ScalpExecutor:
         daily_loss_limit_pct: float = 3.0,
         direction_cooldown_sec: float = 120.0,
         log_dir: str = "gold_trades",
+        learner: TradeLearner | None = None,
     ):
         self.exchange = exchange
         self.paper_trade = paper_trade
@@ -64,6 +66,10 @@ class ScalpExecutor:
         self._last_long_close: float = 0.0
         self._last_short_close: float = 0.0
         self._direction_cooldown: float = direction_cooldown_sec
+
+        # Auto-learning module (optional)
+        self._learner = learner
+        self._confidence_min: float = 0.0  # updated by learner
 
         mode = "PAPER" if paper_trade else "LIVE"
         logger.info("ScalpExecutor initialized in %s mode | TP=%.2f%% SL=%.2f%% | Size=$%.0f | Leverage=%dx",
@@ -180,6 +186,11 @@ class ScalpExecutor:
 
         self._trade_log.append(trade_record)
         self._persist_trade(trade_record)
+
+        # Notify learner of closed trade
+        if self._learner:
+            self._learner.notify_trade_closed()
+
         return trade_record
 
     async def execute_signals(
@@ -212,6 +223,15 @@ class ScalpExecutor:
                 if time.time() - self._last_long_close < self._direction_cooldown:
                     logger.debug("Long direction cooldown active")
                     continue
+                # Learner gate: time-of-day & direction filter
+                if self._learner and not self._learner.is_entry_allowed("long"):
+                    logger.info("Learner blocked LONG entry")
+                    continue
+                # Learner gate: confidence threshold
+                if self._confidence_min > 0 and signals.confidence < self._confidence_min:
+                    logger.info("Learner: confidence %.3f < gate %.3f — skipping LONG",
+                                signals.confidence, self._confidence_min)
+                    continue
                 trade = await self._open_position("long", current_price, symbol, signals)
                 if trade:
                     executed.append(trade)
@@ -219,6 +239,13 @@ class ScalpExecutor:
             elif signal == ScalpSignal.OPEN_SHORT and not self.has_short:
                 if time.time() - self._last_short_close < self._direction_cooldown:
                     logger.debug("Short direction cooldown active")
+                    continue
+                if self._learner and not self._learner.is_entry_allowed("short"):
+                    logger.info("Learner blocked SHORT entry")
+                    continue
+                if self._confidence_min > 0 and signals.confidence < self._confidence_min:
+                    logger.info("Learner: confidence %.3f < gate %.3f — skipping SHORT",
+                                signals.confidence, self._confidence_min)
                     continue
                 trade = await self._open_position("short", current_price, symbol, signals)
                 if trade:
@@ -325,6 +352,18 @@ class ScalpExecutor:
         existing.append(trade)
         with open(log_file, "w") as f:
             json.dump(existing, f, indent=2, default=str)
+
+    def apply_learner_overrides(self, overrides: dict) -> None:
+        """Apply parameter adjustments from the learner."""
+        if "executor.tp_pct" in overrides:
+            self.tp_pct = overrides["executor.tp_pct"] / 100.0
+            logger.info("Learner override: tp_pct → %.2f%%", overrides["executor.tp_pct"])
+        if "executor.sl_pct" in overrides:
+            self.sl_pct = overrides["executor.sl_pct"] / 100.0
+            logger.info("Learner override: sl_pct → %.2f%%", overrides["executor.sl_pct"])
+        if "learner.confidence_min" in overrides:
+            self._confidence_min = overrides["learner.confidence_min"]
+            logger.info("Learner override: confidence_min → %.3f", self._confidence_min)
 
     def get_position_status(self) -> dict:
         """Get current dual position status."""

@@ -26,6 +26,7 @@ from momentum_bot.exchange.base import Candle
 from momentum_bot.indicators.technical import TechnicalIndicators
 from gold_scalper.strategy.scalper import BollingerScalper, ScalpSignal
 from gold_scalper.executor.scalp_executor import ScalpExecutor
+from gold_scalper.learner.trade_learner import TradeLearner
 
 load_dotenv()
 
@@ -133,6 +134,25 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
 
     strategy_cfg = config.get("strategy", {})
     executor_cfg = config.get("executor", {})
+    learner_cfg = config.get("learner", {})
+
+    # Initialize auto-learner (can be disabled via config)
+    learner = None
+    if learner_cfg.get("enabled", True):
+        learner = TradeLearner(
+            log_dir=learner_cfg.get("log_dir", "gold_trades"),
+            lookback_days=learner_cfg.get("lookback_days", 7),
+            review_every_n_trades=learner_cfg.get("review_every_n_trades", 20),
+            min_trades_to_learn=learner_cfg.get("min_trades_to_learn", 30),
+            learning_rate=learner_cfg.get("learning_rate", 0.25),
+            enable_time_filter=learner_cfg.get("enable_time_filter", True),
+            enable_direction_filter=learner_cfg.get("enable_direction_filter", True),
+            enable_tp_sl_tuning=learner_cfg.get("enable_tp_sl_tuning", True),
+            enable_confidence_gate=learner_cfg.get("enable_confidence_gate", True),
+        )
+        # Run initial review on startup if we have enough historical data
+        overrides = learner.review_and_adapt(config)
+        logger.info("Learner initial review: %d overrides", len(overrides))
 
     strategy = BollingerScalper(strategy_cfg)
     executor = ScalpExecutor(
@@ -146,7 +166,12 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
         cooldown_after_losses_sec=executor_cfg.get("cooldown_after_losses_sec", 300),
         daily_loss_limit_pct=executor_cfg.get("daily_loss_limit_pct", 3.0),
         direction_cooldown_sec=executor_cfg.get("direction_cooldown_sec", 120.0),
+        learner=learner,
     )
+
+    # Apply any initial overrides from learner
+    if learner and overrides:
+        executor.apply_learner_overrides(overrides)
 
     logger.info("=" * 60)
     logger.info("Gold Scalper Bot Starting")
@@ -160,6 +185,10 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
                 executor_cfg.get("position_size_usd", 100), leverage,
                 executor_cfg.get("position_size_usd", 100) * leverage)
     logger.info("  Dual mode: LONG + SHORT simultaneously")
+    logger.info("  Auto-learner: %s", "ENABLED" if learner else "DISABLED")
+    if learner:
+        logger.info("    Review every: %d trades", learner_cfg.get("review_every_n_trades", 20))
+        logger.info("    Blocked hours: %s", sorted(learner.blocked_hours) or "none yet")
     logger.info("=" * 60)
 
     # Set leverage
@@ -233,6 +262,12 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
                     summary.get("avg_hold_sec", 0),
                     summary.get("consecutive_losses", 0),
                 )
+
+            # Auto-learner: periodic review and parameter adaptation
+            if learner and learner.should_review():
+                overrides = learner.review_and_adapt(config)
+                if overrides:
+                    executor.apply_learner_overrides(overrides)
 
         except Exception as e:
             logger.error("Error in cycle %d: %s", cycle, e, exc_info=True)

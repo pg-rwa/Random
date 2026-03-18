@@ -32,3 +32,16 @@ executor:
   cooldown_after_losses_sec: 300  # 5 min cooldown after loss streak
   daily_loss_limit_pct: 3.0  # Stop trading if down 3% of equity for the day
   direction_cooldown_sec: 120  # Wait 2 min before re-entering same direction (was 15s)
+
+# Auto-learner — adapts parameters based on trade history
+learner:
+  enabled: true                    # Set false to disable all auto-learning
+  log_dir: "gold_trades"           # Where trade JSON logs live
+  lookback_days: 7                 # How many days of history to analyze
+  review_every_n_trades: 20        # Re-analyze after every N closed trades
+  min_trades_to_learn: 30          # Need at least this many trades before adapting
+  learning_rate: 0.25              # How aggressively to shift parameters (0=none, 1=max)
+  enable_time_filter: true         # Block unprofitable hours (WR<40% + net negative)
+  enable_direction_filter: true    # Disable long/short if WR<45% and net negative
+  enable_tp_sl_tuning: true        # Widen TP when R:R is poor, adjust SL
+  enable_confidence_gate: true     # Raise min confidence when low-conf trades lose
