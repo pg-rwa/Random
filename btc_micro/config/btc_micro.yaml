@@ -1,0 +1,72 @@
+# BTC Micro-Trading Bot Configuration
+# Multi-signal weighted scorer on 1m candles
+# Paper trading on mainnet prices — no real money at risk
+
+symbol: "BTC"
+interval: "1m"
+candle_limit: 100
+loop_interval_seconds: 30        # Check every 30s for faster micro-trade entries
+leverage: 5                      # Conservative for BTC volatility
+
+# Strategy parameters — multi-signal weighted scorer
+strategy:
+  # Signal weights (should roughly sum to 1.0)
+  weight_rsi: 0.20               # RSI extreme bounce detection
+  weight_vwap: 0.15              # VWAP deviation mean-reversion
+  weight_ema: 0.15               # EMA micro-cross on 1m
+  weight_volume: 0.15            # Volume spike confirmation
+  weight_macd: 0.20              # MACD histogram momentum
+  weight_bb: 0.15                # Bollinger Band position
+
+  # Entry/exit thresholds
+  entry_threshold: 0.55          # Minimum composite score to enter
+  exit_threshold: 0.30           # Exit when score drops below this
+
+  # RSI params
+  rsi_oversold: 30.0
+  rsi_overbought: 70.0
+
+  # VWAP deviation (% from VWAP considered "stretched")
+  vwap_deviation_pct: 0.15
+
+  # Volume spike multiplier (1.5x average = spike)
+  volume_spike_mult: 1.5
+
+  # Bollinger Band params
+  bb_period: 20
+  bb_std: 2.0
+  bb_squeeze_width_pct: 0.30     # BB width below this = squeeze
+  min_bb_width_pct: 0.10         # Skip entries when BB too tight
+
+  # EMA periods
+  ema_fast: 8
+  ema_slow: 21
+
+  # Other indicator periods
+  rsi_period: 14
+
+# Executor parameters — micro-trade sizing & risk
+executor:
+  tp_pct: 0.08                   # Take profit: 0.08% (~$68 on $85k BTC)
+  sl_pct: 0.06                   # Stop loss: 0.06% (~$51 on $85k BTC)
+  position_size_usd: 50.0        # Base margin ($50 × 5x = $250 notional)
+  max_consecutive_losses: 4      # Pause after 4 losses
+  cooldown_after_losses_sec: 180 # 3 min cooldown
+  daily_loss_limit_pct: 2.0      # Stop if down 2% of equity
+  direction_cooldown_sec: 60     # 1 min between same-direction entries
+  max_trades_per_hour: 20        # Rate limit to avoid overtrading
+
+# Self-learner — adapts parameters from trade history
+learner:
+  enabled: true
+  log_dir: "btc_trades"
+  lookback_days: 7
+  review_every_n_trades: 15      # More frequent reviews for fast micro-trading
+  min_trades_to_learn: 25
+  learning_rate: 0.20            # Slightly conservative for BTC
+  enable_time_filter: true       # Block unprofitable hours
+  enable_direction_filter: true  # Disable losing direction
+  enable_tp_sl_tuning: true      # Adjust TP/SL from exit analysis
+  enable_confidence_gate: true   # Raise min confidence when losing
+  enable_weight_tuning: true     # Optimize signal weights (BTC-specific)
+  enable_volatility_regime: true # Adapt to BTC vol regimes
