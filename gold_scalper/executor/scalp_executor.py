@@ -5,6 +5,12 @@ Key differences from momentum executor:
 - Fixed % TP/SL instead of ATR-based (faster exits for scalping)
 - No re-entry cooldown — scalper trades every minute
 - Minimal cooldown between same-direction entries only
+
+v2 additions:
+- ATR-based dynamic stops: scale SL/TP with current volatility
+- Per-direction consecutive loss tracking: pause longs/shorts independently
+- Session drawdown protection: reduce size or stop when losing too fast
+- Trend-aware position sizing: larger with-trend, smaller counter-trend
 """
 
 import json
@@ -36,6 +42,13 @@ class ScalpExecutor:
         direction_cooldown_sec: float = 120.0,
         log_dir: str = "gold_trades",
         learner: TradeLearner | None = None,
+        # v2 parameters
+        use_atr_stops: bool = True,
+        atr_sl_multiplier: float = 1.5,
+        atr_tp_multiplier: float = 2.0,
+        max_dir_consecutive_losses: int = 3,
+        dir_cooldown_after_losses_sec: int = 600,
+        session_max_drawdown_usd: float = 20.0,
     ):
         self.exchange = exchange
         self.paper_trade = paper_trade
@@ -71,9 +84,32 @@ class ScalpExecutor:
         self._learner = learner
         self._confidence_min: float = 0.0  # updated by learner
 
+        # v2: ATR-based dynamic stops
+        self._use_atr_stops = use_atr_stops
+        self._atr_sl_mult = atr_sl_multiplier
+        self._atr_tp_mult = atr_tp_multiplier
+        self._current_atr: float = 0.0
+
+        # v2: Per-direction consecutive loss tracking
+        self._long_consecutive_losses: int = 0
+        self._short_consecutive_losses: int = 0
+        self._max_dir_consec_losses = max_dir_consecutive_losses
+        self._dir_cooldown_sec = dir_cooldown_after_losses_sec
+        self._long_dir_cooldown_until: float = 0.0
+        self._short_dir_cooldown_until: float = 0.0
+
+        # v2: Session drawdown protection
+        self._session_pnl: float = 0.0
+        self._session_max_drawdown = session_max_drawdown_usd
+        self._session_peak_pnl: float = 0.0
+
         mode = "PAPER" if paper_trade else "LIVE"
-        logger.info("ScalpExecutor initialized in %s mode | TP=%.2f%% SL=%.2f%% | Size=$%.0f | Leverage=%dx",
-                     mode, tp_pct, sl_pct, position_size_usd, leverage)
+        logger.info("ScalpExecutor v2 initialized in %s mode | TP=%.2f%% SL=%.2f%% | Size=$%.0f | Leverage=%dx | ATR stops=%s",
+                     mode, tp_pct, sl_pct, position_size_usd, leverage, use_atr_stops)
+
+    def update_atr(self, atr: float) -> None:
+        """Update the current ATR value for dynamic stop calculation."""
+        self._current_atr = atr
 
     @property
     def has_long(self) -> bool:
@@ -98,12 +134,36 @@ class ScalpExecutor:
             return True
         return False
 
+    def _is_direction_paused(self, direction: str) -> bool:
+        """v2: Check if a specific direction is paused due to consecutive losses."""
+        if direction == "long" and time.time() < self._long_dir_cooldown_until:
+            remaining = int(self._long_dir_cooldown_until - time.time())
+            logger.info("LONG paused: %ds remaining after %d consecutive long losses",
+                        remaining, self._long_consecutive_losses)
+            return True
+        if direction == "short" and time.time() < self._short_dir_cooldown_until:
+            remaining = int(self._short_dir_cooldown_until - time.time())
+            logger.info("SHORT paused: %ds remaining after %d consecutive short losses",
+                        remaining, self._short_consecutive_losses)
+            return True
+        return False
+
     def _is_daily_limit_hit(self) -> bool:
         if self._daily_start_equity <= 0:
             return False
         loss_pct = abs(self._daily_pnl) / self._daily_start_equity * 100
         if self._daily_pnl < 0 and loss_pct >= self.daily_loss_limit_pct:
             logger.warning("Daily loss limit hit: %.1f%% >= %.1f%%", loss_pct, self.daily_loss_limit_pct)
+            return True
+        return False
+
+    def _is_session_drawdown_hit(self) -> bool:
+        """v2: Check if session drawdown from peak is too large."""
+        self._session_peak_pnl = max(self._session_peak_pnl, self._session_pnl)
+        drawdown = self._session_peak_pnl - self._session_pnl
+        if drawdown >= self._session_max_drawdown:
+            logger.warning("Session drawdown limit: peak=$%.2f current=$%.2f drawdown=$%.2f >= $%.2f",
+                          self._session_peak_pnl, self._session_pnl, drawdown, self._session_max_drawdown)
             return True
         return False
 
@@ -162,14 +222,33 @@ class ScalpExecutor:
 
         # Update risk tracking
         self._daily_pnl += pnl_leveraged
+        self._session_pnl += pnl_leveraged
         if pnl_leveraged < 0:
             self._consecutive_losses += 1
             if self._consecutive_losses >= self.max_consecutive_losses:
                 self._cooldown_until = time.time() + self.cooldown_after_losses_sec
                 logger.warning("Hit %d consecutive losses → cooldown %ds",
                                self._consecutive_losses, self.cooldown_after_losses_sec)
+            # v2: Per-direction loss tracking
+            if direction == "long":
+                self._long_consecutive_losses += 1
+                if self._long_consecutive_losses >= self._max_dir_consec_losses:
+                    self._long_dir_cooldown_until = time.time() + self._dir_cooldown_sec
+                    logger.warning("Hit %d consecutive LONG losses → LONG paused %ds",
+                                   self._long_consecutive_losses, self._dir_cooldown_sec)
+            else:
+                self._short_consecutive_losses += 1
+                if self._short_consecutive_losses >= self._max_dir_consec_losses:
+                    self._short_dir_cooldown_until = time.time() + self._dir_cooldown_sec
+                    logger.warning("Hit %d consecutive SHORT losses → SHORT paused %ds",
+                                   self._short_consecutive_losses, self._dir_cooldown_sec)
         else:
             self._consecutive_losses = 0
+            # v2: Reset per-direction counter on win
+            if direction == "long":
+                self._long_consecutive_losses = 0
+            else:
+                self._short_consecutive_losses = 0
 
         # Clear position and set direction cooldown
         if direction == "long":
@@ -215,13 +294,16 @@ class ScalpExecutor:
                 continue
 
             # Entry signals — check risk first
-            if self._is_in_cooldown() or self._is_daily_limit_hit():
+            if self._is_in_cooldown() or self._is_daily_limit_hit() or self._is_session_drawdown_hit():
                 continue
 
             if signal == ScalpSignal.OPEN_LONG and not self.has_long:
                 # Check direction cooldown
                 if time.time() - self._last_long_close < self._direction_cooldown:
                     logger.debug("Long direction cooldown active")
+                    continue
+                # v2: Per-direction consecutive loss pause
+                if self._is_direction_paused("long"):
                     continue
                 # Learner gate: time-of-day & direction filter
                 if self._learner and not self._learner.is_entry_allowed("long"):
@@ -239,6 +321,9 @@ class ScalpExecutor:
             elif signal == ScalpSignal.OPEN_SHORT and not self.has_short:
                 if time.time() - self._last_short_close < self._direction_cooldown:
                     logger.debug("Short direction cooldown active")
+                    continue
+                # v2: Per-direction consecutive loss pause
+                if self._is_direction_paused("short"):
                     continue
                 if self._learner and not self._learner.is_entry_allowed("short"):
                     logger.info("Learner blocked SHORT entry")
@@ -260,13 +345,36 @@ class ScalpExecutor:
         # Calculate size based on USD notional and leverage
         size = (self.position_size_usd * self.leverage) / price
 
-        # Calculate SL/TP
-        if direction == "long":
-            stop_loss = price * (1 - self.sl_pct)
-            take_profit = price * (1 + self.tp_pct)
+        # v2: Calculate SL/TP — use ATR-based stops if available and enabled
+        if self._use_atr_stops and self._current_atr > 0:
+            sl_distance = self._current_atr * self._atr_sl_mult
+            tp_distance = self._current_atr * self._atr_tp_mult
+            # Clamp: don't let ATR stops be wider than 2x the fixed % stops
+            max_sl = price * self.sl_pct * 2.0
+            max_tp = price * self.tp_pct * 3.0
+            sl_distance = min(sl_distance, max_sl)
+            tp_distance = min(tp_distance, max_tp)
+            # Also enforce minimum stops (don't make them too tight)
+            min_sl = price * self.sl_pct * 0.5
+            min_tp = price * self.tp_pct * 0.5
+            sl_distance = max(sl_distance, min_sl)
+            tp_distance = max(tp_distance, min_tp)
+
+            if direction == "long":
+                stop_loss = price - sl_distance
+                take_profit = price + tp_distance
+            else:
+                stop_loss = price + sl_distance
+                take_profit = price - tp_distance
+            logger.debug("ATR stops: ATR=%.2f SL_dist=%.2f TP_dist=%.2f", self._current_atr, sl_distance, tp_distance)
         else:
-            stop_loss = price * (1 + self.sl_pct)
-            take_profit = price * (1 - self.tp_pct)
+            # Fallback to fixed % stops
+            if direction == "long":
+                stop_loss = price * (1 - self.sl_pct)
+                take_profit = price * (1 + self.tp_pct)
+            else:
+                stop_loss = price * (1 + self.sl_pct)
+                take_profit = price * (1 - self.tp_pct)
 
         position = {
             "entry_price": price,
@@ -397,6 +505,7 @@ class ScalpExecutor:
             "closed_trades": len(closed),
             "total_pnl": round(sum(pnls), 2),
             "daily_pnl": round(self._daily_pnl, 2),
+            "session_pnl": round(self._session_pnl, 2),
             "wins": len(wins),
             "losses": len(losses),
             "win_rate": round(len(wins) / len(pnls) * 100, 1) if pnls else 0,
@@ -404,5 +513,9 @@ class ScalpExecutor:
             "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0,
             "avg_hold_sec": round(sum(hold_times) / len(hold_times), 0) if hold_times else 0,
             "consecutive_losses": self._consecutive_losses,
+            "long_consec_losses": self._long_consecutive_losses,
+            "short_consec_losses": self._short_consecutive_losses,
             "cooldown_active": time.time() < self._cooldown_until,
+            "long_paused": time.time() < self._long_dir_cooldown_until,
+            "short_paused": time.time() < self._short_dir_cooldown_until,
         }

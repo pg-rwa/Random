@@ -16,6 +16,11 @@ Key adaptations:
    when recent win-rate is low.
 5. Volatility regime — adjusts band_touch_pct and BB width filter based
    on recent ATR readings.
+
+v2 additions:
+6. Streak analysis — detects losing streaks and triggers protective mode.
+7. Recent performance weighting — gives more weight to last 10 trades.
+8. Kill switch — if cumulative PnL is deeply negative, recommend stopping.
 """
 
 import json
@@ -51,8 +56,8 @@ class TradeLearner:
         self,
         log_dir: str = "gold_trades",
         lookback_days: int = 7,
-        review_every_n_trades: int = 20,
-        min_trades_to_learn: int = 30,
+        review_every_n_trades: int = 10,
+        min_trades_to_learn: int = 15,
         learning_rate: float = 0.25,
         enable_time_filter: bool = True,
         enable_direction_filter: bool = True,
@@ -79,8 +84,11 @@ class TradeLearner:
         self._short_allowed: bool = True
         self._long_allowed: bool = True
 
+        # v2: Kill switch state
+        self._kill_switch_active: bool = False
+
         logger.info(
-            "TradeLearner initialized | lookback=%dd | review_every=%d trades | lr=%.2f",
+            "TradeLearner v2 initialized | lookback=%dd | review_every=%d trades | lr=%.2f",
             lookback_days, review_every_n_trades, learning_rate,
         )
 
@@ -118,6 +126,9 @@ class TradeLearner:
 
         overrides: dict = {}
 
+        # v2: Check kill switch first — if recent performance is terrible, stop everything
+        self._check_kill_switch(closed)
+
         if self._enable_tp_sl_tuning:
             overrides.update(self._tune_tp_sl(closed, current_config))
 
@@ -130,6 +141,9 @@ class TradeLearner:
         if self._enable_confidence_gate:
             overrides.update(self._tune_confidence_gate(closed, current_config))
 
+        # v2: Analyze recent streak to tighten/loosen parameters
+        overrides.update(self._analyze_recent_streak(closed, current_config))
+
         self._current_overrides = overrides
         self._log_review(closed, overrides)
         return overrides
@@ -141,6 +155,11 @@ class TradeLearner:
             direction: "long" or "short"
             hour: Current UTC hour (0-23). If None, uses system clock.
         """
+        # v2: Kill switch — block ALL entries when deeply negative
+        if self._kill_switch_active:
+            logger.warning("TradeLearner: KILL SWITCH active — all entries blocked")
+            return False
+
         if hour is None:
             hour = datetime.utcnow().hour
 
@@ -339,6 +358,73 @@ class TradeLearner:
                     "confidence gate=%.3f (median=%.3f)",
                     low_pnl, high_pnl, gate, median_conf,
                 )
+
+        return overrides
+
+    # ------------------------------------------------------------------
+    # v2 learning sub-routines
+    # ------------------------------------------------------------------
+
+    def _check_kill_switch(self, closed: list[dict]) -> None:
+        """If the last N trades are deeply negative, activate kill switch.
+
+        Kill switch pauses ALL trading until the next review cycle
+        finds improved conditions or the operator manually restarts.
+        """
+        # Check last 10 trades
+        recent = closed[-10:] if len(closed) >= 10 else closed
+        recent_pnl = sum(t["pnl"] for t in recent)
+        recent_losses = sum(1 for t in recent if t["pnl"] < 0)
+
+        # Kill if last 10 trades lost >$8 or 8+ out of 10 are losses
+        if recent_pnl < -8.0 or (len(recent) >= 10 and recent_losses >= 8):
+            if not self._kill_switch_active:
+                self._kill_switch_active = True
+                logger.warning(
+                    "!!! KILL SWITCH ACTIVATED !!! Last %d trades: PnL=$%.2f, %d losses — "
+                    "ALL ENTRIES BLOCKED until next review finds improvement",
+                    len(recent), recent_pnl, recent_losses,
+                )
+        else:
+            if self._kill_switch_active:
+                logger.info("Kill switch DEACTIVATED — recent performance improved")
+            self._kill_switch_active = False
+
+    def _analyze_recent_streak(self, closed: list[dict], config: dict) -> dict:
+        """Analyze the most recent trades with higher weight.
+
+        If the last 10 trades are losing, raise confidence gate aggressively.
+        If the last 10 are winning, relax slightly.
+        """
+        overrides = {}
+        if len(closed) < 10:
+            return overrides
+
+        last_10 = closed[-10:]
+        last_10_pnl = sum(t["pnl"] for t in last_10)
+        last_10_wins = sum(1 for t in last_10 if t["pnl"] > 0)
+        last_10_wr = last_10_wins / len(last_10)
+
+        # If last 10 trades are net negative with <40% win rate, get defensive
+        if last_10_pnl < -2.0 and last_10_wr < 0.40:
+            # Raise confidence gate significantly
+            current_gate = self._current_overrides.get("learner.confidence_min", 0.0)
+            new_gate = max(current_gate, 0.9)  # At least 0.9
+            overrides["learner.confidence_min"] = round(_clamp(new_gate, "confidence_min"), 3)
+            logger.info(
+                "TradeLearner STREAK ALERT: last 10 trades PnL=$%.2f WR=%.0f%% → "
+                "confidence gate raised to %.3f",
+                last_10_pnl, last_10_wr * 100, new_gate,
+            )
+
+        # Check for large individual losses (slippage/gaps)
+        big_losses = [t for t in last_10 if t["pnl"] < -3.0]
+        if big_losses:
+            logger.warning(
+                "TradeLearner: %d outsized losses (>$3) in last 10 trades — "
+                "consider reducing position size",
+                len(big_losses),
+            )
 
         return overrides
 

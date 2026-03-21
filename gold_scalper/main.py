@@ -47,6 +47,7 @@ def compute_scalp_indicators(candles: list[Candle], config: dict) -> dict:
     """Compute indicators needed for the scalping strategy.
 
     Uses Bollinger Bands + RSI on 1-minute candles.
+    v2: Added EMA50 (trend filter), ADX (trend strength), enhanced ATR.
     """
     if len(candles) < 2:
         return {}
@@ -59,6 +60,7 @@ def compute_scalp_indicators(candles: list[Candle], config: dict) -> dict:
     rsi_period = config.get("rsi_period", 14)
     ema_fast_period = config.get("ema_fast", 9)
     ema_slow_period = config.get("ema_slow", 21)
+    ema_trend_period = config.get("ema_trend", 50)  # v2: longer EMA for trend
 
     # Bollinger Bands
     bb_upper, bb_middle, bb_lower = ti.bollinger_bands(closes, bb_period, bb_std)
@@ -69,9 +71,13 @@ def compute_scalp_indicators(candles: list[Candle], config: dict) -> dict:
     # EMAs for trend context
     ema_fast = ti.ema(closes, ema_fast_period)
     ema_slow = ti.ema(closes, ema_slow_period)
+    ema_trend = ti.ema(closes, ema_trend_period)  # v2: EMA50 trend filter
 
     # ATR for volatility context
     atr_vals = ti.atr(candles, 14)
+
+    # v2: ADX for trend strength
+    adx_vals = ti.adx(candles, 14)
 
     # Volume
     vol_sma = ti.volume_sma(candles, 20)
@@ -90,7 +96,9 @@ def compute_scalp_indicators(candles: list[Candle], config: dict) -> dict:
         "rsi_prev": rsi_vals[-2] if len(rsi_vals) > 1 and not np.isnan(rsi_vals[-2]) else 50.0,
         "ema_fast": ema_fast[-1],
         "ema_slow": ema_slow[-1],
+        "ema_trend": ema_trend[-1],  # v2: EMA50
         "atr": atr_vals[-1] if not np.isnan(atr_vals[-1]) else 0,
+        "adx": adx_vals[-1] if not np.isnan(adx_vals[-1]) else 0,  # v2: ADX
         "volume": current_volume,
         "volume_ratio": current_volume / avg_volume if avg_volume > 0 else 1.0,
     }
@@ -142,8 +150,8 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
         learner = TradeLearner(
             log_dir=learner_cfg.get("log_dir", "gold_trades"),
             lookback_days=learner_cfg.get("lookback_days", 7),
-            review_every_n_trades=learner_cfg.get("review_every_n_trades", 20),
-            min_trades_to_learn=learner_cfg.get("min_trades_to_learn", 30),
+            review_every_n_trades=learner_cfg.get("review_every_n_trades", 10),
+            min_trades_to_learn=learner_cfg.get("min_trades_to_learn", 15),
             learning_rate=learner_cfg.get("learning_rate", 0.25),
             enable_time_filter=learner_cfg.get("enable_time_filter", True),
             enable_direction_filter=learner_cfg.get("enable_direction_filter", True),
@@ -167,6 +175,13 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
         daily_loss_limit_pct=executor_cfg.get("daily_loss_limit_pct", 3.0),
         direction_cooldown_sec=executor_cfg.get("direction_cooldown_sec", 120.0),
         learner=learner,
+        # v2 parameters
+        use_atr_stops=executor_cfg.get("use_atr_stops", True),
+        atr_sl_multiplier=executor_cfg.get("atr_sl_multiplier", 1.5),
+        atr_tp_multiplier=executor_cfg.get("atr_tp_multiplier", 2.0),
+        max_dir_consecutive_losses=executor_cfg.get("max_dir_consecutive_losses", 3),
+        dir_cooldown_after_losses_sec=executor_cfg.get("dir_cooldown_after_losses_sec", 600),
+        session_max_drawdown_usd=executor_cfg.get("session_max_drawdown_usd", 20.0),
     )
 
     # Apply any initial overrides from learner
@@ -174,20 +189,32 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
         executor.apply_learner_overrides(overrides)
 
     logger.info("=" * 60)
-    logger.info("Gold Scalper Bot Starting")
+    logger.info("Gold Scalper Bot v2 Starting")
     logger.info("  Mode: %s", "PAPER" if paper_trade else "LIVE")
     logger.info("  Symbol: %s", symbol)
     logger.info("  Interval: %s (scalp candles)", interval)
     logger.info("  Loop every: %ds", loop_interval)
     logger.info("  Leverage: %dx", leverage)
     logger.info("  TP: %.2f%% | SL: %.2f%%", executor_cfg.get("tp_pct", 0.14), executor_cfg.get("sl_pct", 0.14))
+    logger.info("  ATR stops: %s (SL×%.1f TP×%.1f)",
+                executor_cfg.get("use_atr_stops", True),
+                executor_cfg.get("atr_sl_multiplier", 1.5),
+                executor_cfg.get("atr_tp_multiplier", 2.0))
     logger.info("  Position size: $%.0f × %dx = $%.0f notional",
                 executor_cfg.get("position_size_usd", 100), leverage,
                 executor_cfg.get("position_size_usd", 100) * leverage)
+    logger.info("  Trend filter: %s (ADX range<%d trend>%d)",
+                strategy_cfg.get("use_trend_filter", True),
+                strategy_cfg.get("adx_range_threshold", 25),
+                strategy_cfg.get("adx_trend_threshold", 30))
+    logger.info("  Dir loss breaker: %d consecutive → %ds pause",
+                executor_cfg.get("max_dir_consecutive_losses", 3),
+                executor_cfg.get("dir_cooldown_after_losses_sec", 600))
+    logger.info("  Session max drawdown: $%.0f", executor_cfg.get("session_max_drawdown_usd", 20.0))
     logger.info("  Dual mode: LONG + SHORT simultaneously")
     logger.info("  Auto-learner: %s", "ENABLED" if learner else "DISABLED")
     if learner:
-        logger.info("    Review every: %d trades", learner_cfg.get("review_every_n_trades", 20))
+        logger.info("    Review every: %d trades", learner_cfg.get("review_every_n_trades", 10))
         logger.info("    Blocked hours: %s", sorted(learner.blocked_hours) or "none yet")
     logger.info("=" * 60)
 
@@ -221,6 +248,10 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
             live_price = await exchange.get_price(symbol)
             indicators["close"] = live_price
 
+            # v2: Feed ATR to executor for dynamic stops
+            if indicators.get("atr", 0) > 0:
+                executor.update_atr(indicators["atr"])
+
             # 4. Check SL/TP on existing positions
             closed_trades = await executor.check_stops(live_price)
             for ct in closed_trades:
@@ -243,10 +274,12 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
 
             logger.info(
                 "[%d] Price=%.2f | BB=[%.2f / %.2f / %.2f] w=%.2f%% | RSI=%.1f | "
-                "Pos: %s | %s | Signal: %s",
+                "ADX=%.0f | Trend=%s | ATR=%.2f | Pos: %s | %s | Signal: %s",
                 cycle, live_price,
                 indicators["bb_lower"], indicators["bb_middle"], indicators["bb_upper"],
                 indicators["bb_width_pct"], indicators["rsi"],
+                indicators.get("adx", 0), signals.trend,
+                indicators.get("atr", 0),
                 long_str, short_str, signal_str,
             )
 
@@ -254,13 +287,16 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
             if cycle % 10 == 0:
                 summary = executor.get_trade_summary()
                 logger.info(
-                    "--- Summary: %d trades | PnL=$%.2f | WR=%.0f%% | "
-                    "Avg hold=%ds | Consec losses=%d ---",
+                    "--- Summary: %d trades | PnL=$%.2f (session=$%.2f) | WR=%.0f%% | "
+                    "Avg hold=%ds | Consec losses=%d | L_streak=%d S_streak=%d ---",
                     summary.get("closed_trades", 0),
                     summary.get("total_pnl", 0),
+                    summary.get("session_pnl", 0),
                     summary.get("win_rate", 0),
                     summary.get("avg_hold_sec", 0),
                     summary.get("consecutive_losses", 0),
+                    summary.get("long_consec_losses", 0),
+                    summary.get("short_consec_losses", 0),
                 )
 
             # Auto-learner: periodic review and parameter adaptation
