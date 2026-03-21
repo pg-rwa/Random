@@ -1,8 +1,8 @@
 """BTC micro-trading strategy — multi-signal weighted scorer.
 
-Unlike the gold scalper (pure BB mean-reversion), this uses a composite
-of 6 micro-signals each contributing a weighted score. When the aggregate
-score crosses a threshold, we enter a micro trade with tight TP/SL.
+v2: Lowered entry thresholds, added trend filter (EMA50+ADX),
+    ATR volatility gate, RSI momentum confirmation, reduced
+    signal-spread requirement so the bot actually trades.
 
 Signals:
 1. RSI extreme bounce    — RSI dipping into oversold/overbought then reversing
@@ -39,11 +39,12 @@ class MicroResult:
     confidence: float = 0.0
     long_score: float = 0.0
     short_score: float = 0.0
+    trend: str = "neutral"  # v2: "up", "down", "neutral"
 
     def __str__(self):
         sigs = [s.value for s in self.signals]
         return (f"MicroResult(signals={sigs}, conf={self.confidence:.2f}, "
-                f"L={self.long_score:.2f}, S={self.short_score:.2f})")
+                f"L={self.long_score:.2f}, S={self.short_score:.2f}, trend={self.trend})")
 
 
 class MicroScalper:
@@ -54,27 +55,52 @@ class MicroScalper:
         self.w_rsi = config.get("weight_rsi", 0.20)
         self.w_vwap = config.get("weight_vwap", 0.15)
         self.w_ema = config.get("weight_ema", 0.15)
-        self.w_volume = config.get("weight_volume", 0.15)
-        self.w_macd = config.get("weight_macd", 0.20)
+        self.w_volume = config.get("weight_volume", 0.10)
+        self.w_macd = config.get("weight_macd", 0.25)
         self.w_bb = config.get("weight_bb", 0.15)
 
-        # Thresholds
-        self.entry_threshold = config.get("entry_threshold", 0.55)
-        self.exit_threshold = config.get("exit_threshold", 0.30)
+        # v2: Lowered thresholds — the old 0.55 was nearly impossible to reach
+        self.entry_threshold = config.get("entry_threshold", 0.38)
+        self.exit_threshold = config.get("exit_threshold", 0.20)
+
+        # v2: Reduced spread requirement — old 0.10 was too restrictive
+        self.min_score_spread = config.get("min_score_spread", 0.05)
 
         # RSI params
-        self.rsi_oversold = config.get("rsi_oversold", 30.0)
-        self.rsi_overbought = config.get("rsi_overbought", 70.0)
+        self.rsi_oversold = config.get("rsi_oversold", 35.0)
+        self.rsi_overbought = config.get("rsi_overbought", 65.0)
 
         # VWAP deviation threshold (% from VWAP to consider stretched)
-        self.vwap_dev_pct = config.get("vwap_deviation_pct", 0.15)
+        self.vwap_dev_pct = config.get("vwap_deviation_pct", 0.10)
 
         # Volume spike multiplier
-        self.volume_spike_mult = config.get("volume_spike_mult", 1.5)
+        self.volume_spike_mult = config.get("volume_spike_mult", 1.3)
 
         # BB squeeze detection
         self.bb_squeeze_width_pct = config.get("bb_squeeze_width_pct", 0.30)
-        self.min_bb_width_pct = config.get("min_bb_width_pct", 0.10)
+        self.min_bb_width_pct = config.get("min_bb_width_pct", 0.08)
+
+        # v2: Trend filter
+        self.use_trend_filter = config.get("use_trend_filter", True)
+        self.adx_range_threshold = config.get("adx_range_threshold", 25.0)
+        self.adx_trend_threshold = config.get("adx_trend_threshold", 30.0)
+        self.max_atr_pct = config.get("max_atr_pct", 0.3)
+
+    def _detect_trend(self, indicators: dict) -> str:
+        """Determine trend using EMA50 and EMA crossover."""
+        price = indicators.get("close", 0)
+        ema_fast = indicators.get("ema_fast", 0)
+        ema_slow = indicators.get("ema_slow", 0)
+        ema_trend = indicators.get("ema_trend", 0)
+
+        if ema_trend == 0 or ema_fast == 0 or ema_slow == 0:
+            return "neutral"
+
+        if price > ema_trend and ema_fast > ema_slow:
+            return "up"
+        elif price < ema_trend and ema_fast < ema_slow:
+            return "down"
+        return "neutral"
 
     def evaluate(
         self, indicators: dict, has_long: bool, has_short: bool
@@ -82,6 +108,12 @@ class MicroScalper:
         """Score all micro-signals and decide entry/exit."""
         result = MicroResult()
         price = indicators.get("close", 0)
+        adx = indicators.get("adx", 0)
+        atr = indicators.get("atr", 0)
+
+        # v2: Detect trend
+        trend = self._detect_trend(indicators)
+        result.trend = trend
 
         # Guard NaN
         for key in ["close", "rsi", "vwap", "ema_fast", "ema_slow",
@@ -95,6 +127,14 @@ class MicroScalper:
         if price <= 0:
             result.signals.append(MicroSignal.HOLD)
             return result
+
+        # v2: Volatility gate — skip when ATR is extreme
+        atr_pct = (atr / price * 100) if price > 0 and atr > 0 else 0
+        if atr_pct > self.max_atr_pct:
+            if not has_long and not has_short:
+                result.signals.append(MicroSignal.HOLD)
+                result.reasons.append(f"ATR {atr_pct:.2f}% > {self.max_atr_pct}% — too volatile")
+                return result
 
         # --- Compute individual signal scores ---
         long_scores = {}
@@ -135,9 +175,8 @@ class MicroScalper:
         result.long_score = round(total_long, 3)
         result.short_score = round(total_short, 3)
 
-        # --- EXIT LOGIC ---
+        # --- EXIT LOGIC (always allow exits) ---
         if has_long:
-            # Exit long if short score dominates or long score collapsed
             if total_short > self.entry_threshold or total_long < self.exit_threshold:
                 result.signals.append(MicroSignal.CLOSE_LONG)
                 result.reasons.append(
@@ -153,7 +192,7 @@ class MicroScalper:
                     f"or L={total_long:.2f} > {self.entry_threshold}"
                 )
 
-        # --- ENTRY LOGIC ---
+        # --- ENTRY FILTERS ---
         bb_width_pct = indicators.get("bb_width_pct", 0)
         if bb_width_pct < self.min_bb_width_pct:
             if not result.signals:
@@ -163,26 +202,42 @@ class MicroScalper:
                 )
             return result
 
-        if not has_long and total_long >= self.entry_threshold:
-            # Only enter long if long clearly beats short
-            if total_long > total_short + 0.10:
+        # v2: Trend filter — block counter-trend entries when trend is strong
+        allow_long = True
+        allow_short = True
+        if self.use_trend_filter and adx > self.adx_trend_threshold:
+            if trend == "down":
+                allow_long = False
+            elif trend == "up":
+                allow_short = False
+
+        # --- ENTRY LOGIC ---
+        if not has_long and allow_long and total_long >= self.entry_threshold:
+            if total_long > total_short + self.min_score_spread:
+                # v2: Trend bonus for confidence
+                conf = total_long
+                if trend == "up":
+                    conf += 0.1
                 result.signals.append(MicroSignal.OPEN_LONG)
                 top_signals = sorted(long_scores.items(), key=lambda x: -x[1])[:3]
                 top_str = ", ".join(f"{k}={v:.2f}" for k, v in top_signals)
                 result.reasons.append(
-                    f"Long entry: score={total_long:.2f} [{top_str}]"
+                    f"Long entry: score={total_long:.2f} [{top_str}] trend={trend} ADX={adx:.0f}"
                 )
-                result.confidence = total_long
+                result.confidence = conf
 
-        if not has_short and total_short >= self.entry_threshold:
-            if total_short > total_long + 0.10:
+        if not has_short and allow_short and total_short >= self.entry_threshold:
+            if total_short > total_long + self.min_score_spread:
+                conf = total_short
+                if trend == "down":
+                    conf += 0.1
                 result.signals.append(MicroSignal.OPEN_SHORT)
                 top_signals = sorted(short_scores.items(), key=lambda x: -x[1])[:3]
                 top_str = ", ".join(f"{k}={v:.2f}" for k, v in top_signals)
                 result.reasons.append(
-                    f"Short entry: score={total_short:.2f} [{top_str}]"
+                    f"Short entry: score={total_short:.2f} [{top_str}] trend={trend} ADX={adx:.0f}"
                 )
-                result.confidence = total_short
+                result.confidence = conf
 
         if not result.signals:
             result.signals.append(MicroSignal.HOLD)
@@ -200,17 +255,22 @@ class MicroScalper:
         long_score = 0.0
         short_score = 0.0
 
-        # Long: RSI was oversold and now turning up
+        # Long: RSI oversold
         if rsi < self.rsi_oversold:
             long_score = (self.rsi_oversold - rsi) / self.rsi_oversold
-            if rsi > rsi_prev:  # Turning up — stronger signal
+            if rsi > rsi_prev:  # Turning up — stronger
                 long_score = min(1.0, long_score * 1.5)
+        # v2: Partial credit for approaching oversold
+        elif rsi < 40:
+            long_score = (40 - rsi) / 20.0  # 0 at 40, 0.5 at 30
 
-        # Short: RSI was overbought and now turning down
+        # Short: RSI overbought
         if rsi > self.rsi_overbought:
             short_score = (rsi - self.rsi_overbought) / (100 - self.rsi_overbought)
             if rsi < rsi_prev:  # Turning down
                 short_score = min(1.0, short_score * 1.5)
+        elif rsi > 60:
+            short_score = (rsi - 60) / 20.0
 
         return long_score, short_score
 
@@ -227,11 +287,10 @@ class MicroScalper:
         long_score = 0.0
         short_score = 0.0
 
-        if dev_pct < -threshold * 0.5:
-            # Price below VWAP — bullish reversion
+        # v2: Start scoring at 30% of threshold instead of 50%
+        if dev_pct < -threshold * 0.3:
             long_score = min(1.0, abs(dev_pct) / threshold)
-        elif dev_pct > threshold * 0.5:
-            # Price above VWAP — bearish reversion
+        elif dev_pct > threshold * 0.3:
             short_score = min(1.0, dev_pct / threshold)
 
         return long_score, short_score
@@ -246,27 +305,25 @@ class MicroScalper:
         if ema_slow <= 0:
             return 0.0, 0.0
 
-        # Current spread as % of price
         spread = (ema_fast - ema_slow) / ema_slow * 100
         prev_spread = (ema_fast_prev - ema_slow_prev) / ema_slow_prev * 100 if ema_slow_prev > 0 else 0
 
         long_score = 0.0
         short_score = 0.0
 
-        # Bullish: fast crossing above slow, or spread widening upward
         if ema_fast > ema_slow:
-            long_score = min(1.0, abs(spread) * 10)  # Scale small % to 0-1
+            long_score = min(1.0, abs(spread) * 15)  # v2: more sensitive (was 10)
             if prev_spread < 0:  # Fresh cross
                 long_score = min(1.0, long_score * 1.5)
         elif ema_fast < ema_slow:
-            short_score = min(1.0, abs(spread) * 10)
-            if prev_spread > 0:  # Fresh bearish cross
+            short_score = min(1.0, abs(spread) * 15)
+            if prev_spread > 0:
                 short_score = min(1.0, short_score * 1.5)
 
         return long_score, short_score
 
     def _score_volume(self, ind: dict) -> tuple[float, float]:
-        """Volume spike confirmation — high volume confirms the direction of the candle."""
+        """Volume spike confirmation."""
         volume_ratio = ind.get("volume_ratio", 1.0)
         price = ind.get("close", 0)
         ema_fast = ind.get("ema_fast", 0)
@@ -274,10 +331,8 @@ class MicroScalper:
         if volume_ratio < self.volume_spike_mult:
             return 0.0, 0.0
 
-        # Spike detected — score based on magnitude
         spike_score = min(1.0, (volume_ratio - 1.0) / (self.volume_spike_mult - 1.0))
 
-        # Direction: if price > ema_fast, volume confirms bullish; else bearish
         if price > ema_fast:
             return spike_score, 0.0
         elif price < ema_fast:
@@ -330,12 +385,11 @@ class MicroScalper:
         long_score = 0.0
         short_score = 0.0
 
-        # Near lower band — bullish
-        if dist_to_lower < 0.25:
-            long_score = 1.0 - dist_to_lower / 0.25
+        # v2: Wider zone (was 0.25, now 0.35) for more signals
+        if dist_to_lower < 0.35:
+            long_score = 1.0 - dist_to_lower / 0.35
 
-        # Near upper band — bearish
-        if dist_to_upper < 0.25:
-            short_score = 1.0 - dist_to_upper / 0.25
+        if dist_to_upper < 0.35:
+            short_score = 1.0 - dist_to_upper / 0.35
 
         return long_score, short_score

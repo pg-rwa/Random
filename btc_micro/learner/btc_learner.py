@@ -1,12 +1,15 @@
 """Self-learning module for BTC micro-trading bot.
 
+v2: Faster adaptation, kill switch, enhanced streak analysis,
+    momentum-weighted learning, ATR stop tuning.
+
 Adapted from the gold scalper learner with BTC-specific enhancements:
 - Signal weight optimization: adjusts the 6 signal weights based on
   which signals were most predictive of winning trades
 - Volatility regime detection: BTC has distinct vol regimes — tightens
   params in low-vol, loosens in high-vol
 - Streak analysis: detects extended losing streaks and temporarily
-  raises entry threshold
+  raises entry threshold or activates kill switch
 - All original learner features: TP/SL tuning, direction filter,
   time-of-day filter, confidence gate
 """
@@ -25,9 +28,11 @@ _BOUNDS = {
     "tp_pct": (0.04, 0.25),
     "sl_pct": (0.03, 0.15),
     "confidence_min": (0.0, 1.5),
-    "entry_threshold": (0.35, 0.80),
+    "entry_threshold": (0.30, 0.80),
     "direction_cooldown_sec": (30.0, 600.0),
     "weight": (0.05, 0.40),
+    "atr_tp_mult": (0.8, 3.0),
+    "atr_sl_mult": (0.5, 2.0),
 }
 
 
@@ -43,15 +48,19 @@ class BTCLearner:
         self,
         log_dir: str = "btc_trades",
         lookback_days: int = 7,
-        review_every_n_trades: int = 15,
-        min_trades_to_learn: int = 25,
-        learning_rate: float = 0.20,
+        review_every_n_trades: int = 10,  # v2: faster reviews (was 15)
+        min_trades_to_learn: int = 15,    # v2: lower bar (was 25)
+        learning_rate: float = 0.25,      # v2: faster adaptation (was 0.20)
         enable_time_filter: bool = True,
         enable_direction_filter: bool = True,
         enable_tp_sl_tuning: bool = True,
         enable_confidence_gate: bool = True,
         enable_weight_tuning: bool = True,
         enable_volatility_regime: bool = True,
+        enable_kill_switch: bool = True,        # v2: new
+        enable_atr_stop_tuning: bool = True,    # v2: new
+        kill_switch_loss_streak: int = 6,       # v2: pause after N losses
+        kill_switch_drawdown_pct: float = 1.5,  # v2: pause at session drawdown %
     ):
         self._log_dir = Path(log_dir)
         self._lookback_days = lookback_days
@@ -66,6 +75,12 @@ class BTCLearner:
         self._enable_confidence_gate = enable_confidence_gate
         self._enable_weight_tuning = enable_weight_tuning
         self._enable_volatility_regime = enable_volatility_regime
+        self._enable_kill_switch = enable_kill_switch
+        self._enable_atr_stop_tuning = enable_atr_stop_tuning
+
+        # Kill switch params
+        self._kill_switch_loss_streak = kill_switch_loss_streak
+        self._kill_switch_drawdown_pct = kill_switch_drawdown_pct
 
         # State
         self._trades_since_review: int = 0
@@ -75,9 +90,14 @@ class BTCLearner:
         self._short_allowed: bool = True
         self._long_allowed: bool = True
 
+        # v2: Momentum tracking — weight recent trades more
+        self._recent_win_rate: float = 0.5
+        self._review_count: int = 0
+
         logger.info(
-            "BTCLearner initialized | lookback=%dd | review_every=%d trades | lr=%.2f",
-            lookback_days, review_every_n_trades, learning_rate,
+            "BTCLearner v2 initialized | lookback=%dd | review_every=%d trades | "
+            "lr=%.2f | kill_switch=%s",
+            lookback_days, review_every_n_trades, learning_rate, enable_kill_switch,
         )
 
     # ------------------------------------------------------------------
@@ -88,12 +108,16 @@ class BTCLearner:
         self._trades_since_review += 1
 
     def should_review(self) -> bool:
-        return self._trades_since_review >= self._review_interval
+        # v2: Also trigger review on time (every 5 min minimum)
+        time_trigger = (time.time() - self._last_review_ts) > 300
+        trade_trigger = self._trades_since_review >= self._review_interval
+        return trade_trigger or (time_trigger and self._trades_since_review >= 3)
 
     def review_and_adapt(self, current_config: dict) -> dict:
         """Full learning cycle. Returns dict of parameter overrides."""
         self._trades_since_review = 0
         self._last_review_ts = time.time()
+        self._review_count += 1
 
         trades = self._load_recent_trades()
         closed = [t for t in trades if t.get("status") == "closed" and "pnl" in t]
@@ -107,8 +131,20 @@ class BTCLearner:
 
         overrides: dict = {}
 
+        # v2: Kill switch check first (most urgent)
+        if self._enable_kill_switch:
+            kill = self._check_kill_switch(closed)
+            if kill:
+                overrides.update(kill)
+                self._current_overrides = overrides
+                self._log_review(closed, overrides)
+                return overrides  # Skip other tuning when kill switch active
+
         if self._enable_tp_sl_tuning:
             overrides.update(self._tune_tp_sl(closed, current_config))
+
+        if self._enable_atr_stop_tuning:
+            overrides.update(self._tune_atr_stops(closed, current_config))
 
         if self._enable_direction_filter:
             overrides.update(self._tune_direction_bias(closed, current_config))
@@ -124,6 +160,11 @@ class BTCLearner:
 
         if self._enable_volatility_regime:
             overrides.update(self._tune_volatility_regime(closed, current_config))
+
+        # v2: Track momentum
+        recent = closed[-20:] if len(closed) > 20 else closed
+        recent_wins = len([t for t in recent if t["pnl"] > 0])
+        self._recent_win_rate = recent_wins / len(recent) if recent else 0.5
 
         self._current_overrides = overrides
         self._log_review(closed, overrides)
@@ -159,6 +200,38 @@ class BTCLearner:
     # Learning sub-routines
     # ------------------------------------------------------------------
 
+    def _check_kill_switch(self, closed: list[dict]) -> dict | None:
+        """v2: Activate kill switch on extreme losing conditions."""
+        # Check recent streak
+        recent = closed[-self._kill_switch_loss_streak:]
+        if len(recent) >= self._kill_switch_loss_streak:
+            all_losses = all(t["pnl"] < 0 for t in recent)
+            if all_losses:
+                logger.warning(
+                    "KILL SWITCH: %d consecutive losses detected — pausing trading",
+                    self._kill_switch_loss_streak,
+                )
+                return {"learner.kill_switch": True}
+
+        # Check session drawdown
+        recent_30 = closed[-30:] if len(closed) > 30 else closed
+        session_pnl = sum(t["pnl"] for t in recent_30)
+        if recent_30:
+            avg_price = sum(t.get("entry_price", 0) for t in recent_30) / len(recent_30)
+            if avg_price > 0:
+                # Rough equity approximation
+                base_equity = avg_price * 0.003  # ~$250 notional as reference
+                if base_equity > 0 and session_pnl < 0:
+                    drawdown_pct = abs(session_pnl) / base_equity * 100
+                    if drawdown_pct > self._kill_switch_drawdown_pct * 10:
+                        logger.warning(
+                            "KILL SWITCH: excessive drawdown $%.2f — pausing",
+                            session_pnl,
+                        )
+                        return {"learner.kill_switch": True}
+
+        return None
+
     def _tune_tp_sl(self, closed: list[dict], config: dict) -> dict:
         """Adjust TP/SL based on exit-type analysis."""
         overrides = {}
@@ -179,9 +252,15 @@ class BTCLearner:
             logger.info("BTCLearner: SL rate %.0f%% -> widening SL to %.3f%%",
                         sl_rate * 100, overrides["executor.sl_pct"])
 
-        # TP rarely hit — widen it
-        if tp_rate < 0.10 and len(closed) > 30:
-            new_tp = curr_tp + self._lr * 0.02
+        # TP rarely hit — tighten it for micro profits
+        if tp_rate < 0.15 and len(closed) > 20:
+            new_tp = curr_tp - self._lr * 0.01  # v2: tighten instead of widen for micro
+            overrides["executor.tp_pct"] = round(_clamp(new_tp, "tp_pct"), 4)
+            logger.info("BTCLearner: TP rate %.0f%% -> tightening TP to %.3f%%",
+                        tp_rate * 100, overrides["executor.tp_pct"])
+        elif tp_rate > 0.50:
+            # v2: Winning a lot of TPs — can try for more profit
+            new_tp = curr_tp + self._lr * 0.01
             overrides["executor.tp_pct"] = round(_clamp(new_tp, "tp_pct"), 4)
             logger.info("BTCLearner: TP rate %.0f%% -> widening TP to %.3f%%",
                         tp_rate * 100, overrides["executor.tp_pct"])
@@ -204,11 +283,46 @@ class BTCLearner:
 
         return overrides
 
+    def _tune_atr_stops(self, closed: list[dict], config: dict) -> dict:
+        """v2: Tune ATR multipliers based on trade outcomes."""
+        overrides = {}
+
+        # Separate trades by stop type
+        atr_trades = [t for t in closed if t.get("atr_at_entry", 0) > 0]
+        if len(atr_trades) < 10:
+            return overrides
+
+        stop_losses = [t for t in atr_trades if t.get("signal") == "STOP_LOSS"]
+        take_profits = [t for t in atr_trades if t.get("signal") == "TAKE_PROFIT"]
+
+        sl_rate = len(stop_losses) / len(atr_trades) if atr_trades else 0
+
+        exec_cfg = config.get("executor", {})
+        curr_atr_tp = exec_cfg.get("atr_tp_mult", 1.5)
+        curr_atr_sl = exec_cfg.get("atr_sl_mult", 1.0)
+
+        # Too many ATR stop-outs -> widen SL multiplier
+        if sl_rate > 0.45:
+            new_sl_mult = curr_atr_sl + self._lr * 0.15
+            overrides["executor.atr_sl_mult"] = round(_clamp(new_sl_mult, "atr_sl_mult"), 2)
+            logger.info("BTCLearner: ATR SL rate %.0f%% -> atr_sl_mult=%.2f",
+                        sl_rate * 100, overrides["executor.atr_sl_mult"])
+
+        # Low TP rate -> tighten TP multiplier for quicker exits
+        tp_rate = len(take_profits) / len(atr_trades) if atr_trades else 0
+        if tp_rate < 0.15:
+            new_tp_mult = curr_atr_tp - self._lr * 0.1
+            overrides["executor.atr_tp_mult"] = round(_clamp(new_tp_mult, "atr_tp_mult"), 2)
+            logger.info("BTCLearner: ATR TP rate %.0f%% -> atr_tp_mult=%.2f",
+                        tp_rate * 100, overrides["executor.atr_tp_mult"])
+
+        return overrides
+
     def _tune_direction_bias(self, closed: list[dict], config: dict) -> dict:
         overrides = {}
         for direction in ("long", "short"):
             dir_trades = [t for t in closed if t.get("direction") == direction]
-            if len(dir_trades) < 8:
+            if len(dir_trades) < 6:  # v2: lower bar (was 8)
                 continue
 
             dir_wins = [t for t in dir_trades if t["pnl"] > 0]
@@ -273,7 +387,7 @@ class BTCLearner:
             if o and "confidence" in o:
                 conf_trades.append((o["confidence"], t["pnl"]))
 
-        if len(conf_trades) < 15:
+        if len(conf_trades) < 10:  # v2: lower bar (was 15)
             return overrides
 
         conf_trades.sort(key=lambda x: x[0])
@@ -295,11 +409,7 @@ class BTCLearner:
     def _tune_signal_weights(
         self, all_trades: list[dict], closed: list[dict], config: dict
     ) -> dict:
-        """Analyze which signal scores correlated with winning trades.
-
-        Matches open-trade records (which have long_score/short_score)
-        with their closed counterparts to see which signal-rich entries won.
-        """
+        """Analyze which signal scores correlated with winning trades."""
         overrides = {}
         opens = [t for t in all_trades if t.get("status") == "filled"]
         open_by_key = {}
@@ -307,7 +417,6 @@ class BTCLearner:
             key = (o.get("entry_price"), o.get("direction"))
             open_by_key[key] = o
 
-        # Collect (direction, score, pnl) pairs
         scored_trades = []
         for t in closed:
             key = (t.get("entry_price"), t.get("direction"))
@@ -321,10 +430,9 @@ class BTCLearner:
                     "pnl": t["pnl"],
                 })
 
-        if len(scored_trades) < 20:
+        if len(scored_trades) < 15:  # v2: lower bar (was 20)
             return overrides
 
-        # Analyze: did high-score entries actually win?
         wins = [t for t in scored_trades if t["pnl"] > 0]
         losses = [t for t in scored_trades if t["pnl"] < 0]
 
@@ -341,12 +449,9 @@ class BTCLearner:
             for t in losses
         ) / len(losses)
 
-        # If winners have notably higher scores, the strategy is working.
-        # If not, raise the entry threshold to be more selective.
         score_gap = avg_win_score - avg_loss_score
         if score_gap < 0.05:
-            # Scores aren't differentiating — raise threshold
-            curr_threshold = config.get("strategy", {}).get("entry_threshold", 0.55)
+            curr_threshold = config.get("strategy", {}).get("entry_threshold", 0.38)
             new_threshold = curr_threshold + self._lr * 0.05
             overrides["strategy.entry_threshold"] = round(
                 _clamp(new_threshold, "entry_threshold"), 3
@@ -356,8 +461,7 @@ class BTCLearner:
                 score_gap, overrides["strategy.entry_threshold"],
             )
         elif score_gap > 0.15:
-            # Good discrimination — can lower threshold slightly
-            curr_threshold = config.get("strategy", {}).get("entry_threshold", 0.55)
+            curr_threshold = config.get("strategy", {}).get("entry_threshold", 0.38)
             new_threshold = curr_threshold - self._lr * 0.02
             overrides["strategy.entry_threshold"] = round(
                 _clamp(new_threshold, "entry_threshold"), 3
@@ -370,16 +474,11 @@ class BTCLearner:
         return overrides
 
     def _tune_volatility_regime(self, closed: list[dict], config: dict) -> dict:
-        """Detect BTC volatility regime from recent trade outcomes.
-
-        In high-vol: widen TP/SL to avoid noise stops.
-        In low-vol: tighten for quicker micro-profits.
-        """
+        """Detect BTC volatility regime from recent trade outcomes."""
         overrides = {}
-        if len(closed) < 15:
+        if len(closed) < 10:  # v2: lower bar (was 15)
             return overrides
 
-        # Use price range from recent trades as volatility proxy
         recent = closed[-30:] if len(closed) > 30 else closed
         prices = []
         for t in recent:
@@ -447,10 +546,16 @@ class BTCLearner:
         wins = len([t for t in closed if t["pnl"] > 0])
         wr = wins / len(closed) * 100 if closed else 0
 
+        # v2: Recent momentum
+        recent = closed[-10:] if len(closed) > 10 else closed
+        recent_wr = len([t for t in recent if t["pnl"] > 0]) / len(recent) * 100 if recent else 0
+
         logger.info("=" * 55)
-        logger.info("BTCLearner Review Complete")
+        logger.info("BTCLearner v2 Review #%d", self._review_count)
         logger.info("  Analyzed: %d trades | PnL=$%.2f | WR=%.1f%%",
                      len(closed), total_pnl, wr)
+        logger.info("  Recent 10: WR=%.1f%% | Momentum=%s",
+                     recent_wr, "UP" if recent_wr > wr else "DOWN")
         logger.info("  Blocked hours: %s", sorted(self._blocked_hours) or "none")
         logger.info("  Longs: %s | Shorts: %s",
                      "ON" if self._long_allowed else "OFF",
