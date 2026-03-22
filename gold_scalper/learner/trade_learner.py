@@ -262,8 +262,9 @@ class TradeLearner:
             wr = len(dir_wins) / len(dir_trades)
             dir_pnl = sum(t["pnl"] for t in dir_trades)
 
-            # If win rate < 45% AND net negative, disable this direction
-            if wr < 0.45 and dir_pnl < 0:
+            # If win rate < 35% AND net negative, disable this direction
+            # v3: lowered from 45% — was too aggressive, disabled directions too fast
+            if wr < 0.35 and dir_pnl < -2.0:
                 if direction == "short":
                     self._short_allowed = False
                 else:

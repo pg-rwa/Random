@@ -53,25 +53,25 @@ class BollingerScalper:
         self.bb_period: int = config.get("bb_period", 20)
         self.bb_std: float = config.get("bb_std", 2.0)
         self.rsi_period: int = config.get("rsi_period", 14)
-        self.rsi_oversold: float = config.get("rsi_oversold", 35.0)
-        self.rsi_overbought: float = config.get("rsi_overbought", 65.0)
+        self.rsi_oversold: float = config.get("rsi_oversold", 38.0)
+        self.rsi_overbought: float = config.get("rsi_overbought", 62.0)
         self.rsi_exit_long: float = config.get("rsi_exit_long", 55.0)
         self.rsi_exit_short: float = config.get("rsi_exit_short", 45.0)
         # How close to the band (as % of band width) to trigger entry
-        self.band_touch_pct: float = config.get("band_touch_pct", 0.15)
+        self.band_touch_pct: float = config.get("band_touch_pct", 0.30)
         # Minimum BB width (%) to allow entries — below this, bands are too tight (breakout zone)
-        self.min_bb_width_pct: float = config.get("min_bb_width_pct", 0.25)
+        self.min_bb_width_pct: float = config.get("min_bb_width_pct", 0.15)
 
         # --- v2: Trend filter ---
         self.use_trend_filter: bool = config.get("use_trend_filter", True)
         # ADX below this = ranging (mean-reversion friendly)
-        self.adx_range_threshold: float = config.get("adx_range_threshold", 25.0)
+        self.adx_range_threshold: float = config.get("adx_range_threshold", 30.0)
         # ADX above this = strong trend (only trade with trend, never against)
-        self.adx_trend_threshold: float = config.get("adx_trend_threshold", 30.0)
+        self.adx_trend_threshold: float = config.get("adx_trend_threshold", 40.0)
         # Max ATR as % of price — skip entries when volatility is extreme
         self.max_atr_pct: float = config.get("max_atr_pct", 0.5)
         # Require RSI to be turning (prev RSI more extreme than current)
-        self.require_rsi_turn: bool = config.get("require_rsi_turn", True)
+        self.require_rsi_turn: bool = config.get("require_rsi_turn", False)
 
     def _detect_trend(self, indicators: dict) -> str:
         """Determine trend direction using EMA50 and EMA crossover."""
