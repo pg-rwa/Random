@@ -222,9 +222,10 @@ class MicroExecutor:
             tp_distance = atr * self._atr_tp_mult
             sl_distance = atr * self._atr_sl_mult
 
-            # Clamp to reasonable bounds (min 0.03%, max 0.20%)
-            min_dist = price * 0.0003
-            max_dist = price * 0.0020
+            # Clamp to reasonable bounds (min 0.05%, max 0.35%)
+            # v3: widened from 0.03%-0.20% — BTC needs more room on 1m timeframe
+            min_dist = price * 0.0005
+            max_dist = price * 0.0035
             tp_distance = max(min_dist, min(max_dist, tp_distance))
             sl_distance = max(min_dist, min(max_dist, sl_distance))
         else:

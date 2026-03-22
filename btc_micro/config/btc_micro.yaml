@@ -55,8 +55,8 @@ strategy:
 
 # Executor parameters — micro-trade sizing & risk
 executor:
-  tp_pct: 0.08                   # Take profit: 0.08% (~$68 on $85k BTC)
-  sl_pct: 0.06                   # Stop loss: 0.06% (~$51 on $85k BTC)
+  tp_pct: 0.15                   # v3: widened from 0.08% — was too tight, all trades stopped out
+  sl_pct: 0.12                   # v3: widened from 0.06% — BTC 1m noise exceeds 0.06%
   position_size_usd: 40.0        # v2: Smaller micro positions ($40 × 5x = $200 notional)
   max_consecutive_losses: 4      # Pause after 4 losses
   cooldown_after_losses_sec: 120 # v2: 2 min cooldown (was 3 min)
@@ -66,12 +66,12 @@ executor:
 
   # v2: ATR-based dynamic stops
   use_atr_stops: true            # Use ATR for dynamic TP/SL
-  atr_tp_mult: 1.5               # TP at 1.5x ATR
-  atr_sl_mult: 1.0               # SL at 1.0x ATR
+  atr_tp_mult: 2.5               # v3: widened from 1.5 — give trades room to reach TP
+  atr_sl_mult: 1.8               # v3: widened from 1.0 — 1x ATR = instant stop-outs on BTC
 
   # v2: Trailing stop
-  trailing_stop_activate_pct: 0.05  # Activate after 0.05% profit
-  trailing_stop_distance_pct: 0.03  # Trail at 0.03% behind best price
+  trailing_stop_activate_pct: 0.10  # v3: widened from 0.05% — activate after meaningful profit
+  trailing_stop_distance_pct: 0.06  # v3: widened from 0.03% — don't get shaken out by noise
 
   # v2: Session drawdown circuit breaker
   session_drawdown_limit_pct: 3.0   # Pause if session down 3%
