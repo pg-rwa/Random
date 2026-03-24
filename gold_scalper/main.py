@@ -286,6 +286,7 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
             # Print summary every 10 cycles
             if cycle % 10 == 0:
                 summary = executor.get_trade_summary()
+                pts = summary.get("per_trade_stats", {})
                 logger.info(
                     "--- Summary: %d trades | PnL=$%.2f (session=$%.2f) | WR=%.0f%% | "
                     "Avg hold=%ds | Consec losses=%d | L_streak=%d S_streak=%d ---",
@@ -298,6 +299,16 @@ async def run_scalper(config: dict, paper_trade: bool = True) -> None:
                     summary.get("long_consec_losses", 0),
                     summary.get("short_consec_losses", 0),
                 )
+                if pts.get("total_trades", 0) > 0:
+                    logger.info(
+                        "--- PerTrade: last5_wr=%.0f%% | last10_wr=%.0f%% | "
+                        "dd=$%.2f | L_blocked=%s S_blocked=%s ---",
+                        pts.get("last5_wr", 0),
+                        pts.get("last10_wr", 0),
+                        pts.get("session_drawdown", 0),
+                        pts.get("long_blocked", False),
+                        pts.get("short_blocked", False),
+                    )
 
             # Auto-learner: periodic review and parameter adaptation
             if learner and learner.should_review():

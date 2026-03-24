@@ -295,6 +295,7 @@ async def run_micro_bot(config: dict, paper_trade: bool = True) -> None:
             # Summary every 10 cycles
             if cycle % 10 == 0:
                 summary = executor.get_trade_summary()
+                pts = summary.get("per_trade_stats", {})
                 logger.info(
                     "--- Summary: %d trades | PnL=$%.2f | Session=$%.2f | WR=%.0f%% | "
                     "Avg hold=%ds | Losses streak=%d | Trades/hr=%d | Size=$%.0f ---",
@@ -307,6 +308,16 @@ async def run_micro_bot(config: dict, paper_trade: bool = True) -> None:
                     summary.get("trades_this_hour", 0),
                     summary.get("position_size_usd", 40),
                 )
+                if pts.get("total_trades", 0) > 0:
+                    logger.info(
+                        "--- PerTrade: last5_wr=%.0f%% | last10_wr=%.0f%% | "
+                        "dd=$%.2f | L_blocked=%s S_blocked=%s ---",
+                        pts.get("last5_wr", 0),
+                        pts.get("last10_wr", 0),
+                        pts.get("session_drawdown", 0),
+                        pts.get("long_blocked", False),
+                        pts.get("short_blocked", False),
+                    )
 
             # Auto-learner: periodic review
             if learner and learner.should_review():

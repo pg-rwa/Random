@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from momentum_bot.exchange.base import ExchangeBase, OrderSide
+from momentum_bot.learner.per_trade_analyzer import PerTradeAnalyzer, EntryVerdict
 from btc_micro.strategy.micro_scalper import MicroSignal, MicroResult
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,16 @@ class MicroExecutor:
         # Auto-learner
         self._learner = learner
         self._confidence_min: float = 0.0
+
+        # v3: Per-trade self-learning analyzer
+        self._per_trade = PerTradeAnalyzer(
+            bot_name="BTC",
+            min_recent_wr=0.30,
+            min_direction_wr=0.25,
+            max_consecutive_sl=3,
+            max_same_dir_sl=2,
+            cooldown_after_block_sec=120,
+        )
 
         # v2: ATR-based dynamic stops
         self._use_atr_stops = use_atr_stops
@@ -362,6 +373,19 @@ class MicroExecutor:
         self._trade_log.append(trade_record)
         self._persist_trade(trade_record)
 
+        # v3: Record in per-trade analyzer for real-time learning
+        self._per_trade.record_trade(
+            direction=direction,
+            signal=reason,
+            entry_price=pos["entry_price"],
+            exit_price=exit_price,
+            pnl=pnl,
+            hold_time_sec=hold_sec,
+            confidence=pos.get("confidence", 0.0),
+            atr_at_entry=pos.get("atr_at_entry", 0),
+            trend=pos.get("trend", "neutral"),
+        )
+
         if self._learner:
             self._learner.notify_trade_closed()
 
@@ -409,7 +433,16 @@ class MicroExecutor:
                         signals.confidence, self._confidence_min,
                     )
                     continue
-                trade = await self._open_position("long", current_price, symbol, signals, atr)
+                # v3: Per-trade self-learning check
+                verdict = self._per_trade.should_enter(
+                    "long", signals.confidence, signals.trend,
+                )
+                if not verdict.allowed:
+                    logger.info("PerTrade BLOCKED LONG: %s", verdict.reasons)
+                    continue
+                trade = await self._open_position(
+                    "long", current_price, symbol, signals, atr, verdict,
+                )
                 if trade:
                     executed.append(trade)
 
@@ -428,7 +461,16 @@ class MicroExecutor:
                         signals.confidence, self._confidence_min,
                     )
                     continue
-                trade = await self._open_position("short", current_price, symbol, signals, atr)
+                # v3: Per-trade self-learning check
+                verdict = self._per_trade.should_enter(
+                    "short", signals.confidence, signals.trend,
+                )
+                if not verdict.allowed:
+                    logger.info("PerTrade BLOCKED SHORT: %s", verdict.reasons)
+                    continue
+                trade = await self._open_position(
+                    "short", current_price, symbol, signals, atr, verdict,
+                )
                 if trade:
                     executed.append(trade)
 
@@ -436,15 +478,33 @@ class MicroExecutor:
 
     async def _open_position(
         self, direction: str, price: float, symbol: str, signals: MicroResult,
-        atr: float = 0.0,
+        atr: float = 0.0, verdict: EntryVerdict | None = None,
     ) -> dict | None:
         """Open a new micro position."""
         # v2: Dynamic position sizing on streak
         effective_size_usd = self._get_effective_size()
+        # v3: Apply per-trade sizing adjustment
+        if verdict and verdict.size_multiplier != 1.0:
+            effective_size_usd *= verdict.size_multiplier
+            logger.info("PerTrade sizing: $%.0f → $%.0f (×%.2f)",
+                        self._get_effective_size(), effective_size_usd,
+                        verdict.size_multiplier)
         size = (effective_size_usd * self.leverage) / price
 
         # v2: Dynamic ATR-based stops
         stop_loss, take_profit = self._compute_dynamic_stops(direction, price, atr)
+        # v3: Apply per-trade stop adjustments
+        if verdict and (verdict.tp_multiplier != 1.0 or verdict.sl_multiplier != 1.0):
+            if direction == "long":
+                sl_dist = price - stop_loss
+                tp_dist = take_profit - price
+                stop_loss = price - sl_dist * verdict.sl_multiplier
+                take_profit = price + tp_dist * verdict.tp_multiplier
+            else:
+                sl_dist = stop_loss - price
+                tp_dist = price - take_profit
+                stop_loss = price + sl_dist * verdict.sl_multiplier
+                take_profit = price - tp_dist * verdict.tp_multiplier
 
         position = {
             "entry_price": price,
@@ -454,6 +514,8 @@ class MicroExecutor:
             "open_time": time.time(),
             "best_price": price,  # v2: for trailing stop
             "atr_at_entry": atr,
+            "confidence": signals.confidence,  # v3: for per-trade learning
+            "trend": signals.trend,            # v3: for per-trade learning
         }
 
         trade_record = {
@@ -614,4 +676,5 @@ class MicroExecutor:
             "cooldown_active": time.time() < self._cooldown_until,
             "trades_this_hour": len(self._hour_trade_timestamps),
             "position_size_usd": self._get_effective_size(),
+            "per_trade_stats": self._per_trade.get_stats(),
         }
