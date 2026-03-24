@@ -3,6 +3,10 @@
 v2: Lowered entry thresholds, added trend filter (EMA50+ADX),
     ATR volatility gate, RSI momentum confirmation, reduced
     signal-spread requirement so the bot actually trades.
+v4: Trend dampening — penalise counter-trend mean-reversion signals
+    (RSI, VWAP, BB) so the bot stops going long in downtrends.
+    Stronger trend filter (ADX 22), higher score-spread (0.10),
+    and smarter exit logic that holds winners longer.
 
 Signals:
 1. RSI extreme bounce    — RSI dipping into oversold/overbought then reversing
@@ -172,24 +176,55 @@ class MicroScalper:
 
         total_long = sum(long_scores.values())
         total_short = sum(short_scores.values())
+
+        # v4: Trend dampening — penalise counter-trend mean-reversion signals.
+        # In a downtrend, RSI/VWAP/BB produce strong "buy the dip" long scores
+        # that cause the bot to catch falling knives. Dampen them heavily.
+        if trend == "down":
+            # Dampen long mean-reversion signals (keep EMA/MACD/volume intact)
+            dampen = 0.35  # keep only 35% of counter-trend score
+            for key in ("rsi", "vwap", "bb"):
+                if key in long_scores and long_scores[key] > 0:
+                    reduction = long_scores[key] * (1 - dampen)
+                    long_scores[key] *= dampen
+                    total_long -= reduction
+            # Boost short scores slightly when trend confirms
+            total_short *= 1.10
+        elif trend == "up":
+            dampen = 0.35
+            for key in ("rsi", "vwap", "bb"):
+                if key in short_scores and short_scores[key] > 0:
+                    reduction = short_scores[key] * (1 - dampen)
+                    short_scores[key] *= dampen
+                    total_short -= reduction
+            total_long *= 1.10
+
+        total_long = max(0.0, total_long)
+        total_short = max(0.0, total_short)
         result.long_score = round(total_long, 3)
         result.short_score = round(total_short, 3)
 
         # --- EXIT LOGIC (always allow exits) ---
+        # v4: Require stronger opposing signal to exit a winning position.
+        # Old logic exited at entry_threshold (0.38) — too early, cut winners short.
+        # Now require opposing score to beat current direction + spread (signal flip).
+        exit_flip_threshold = self.entry_threshold + self.min_score_spread  # ~0.48
+
         if has_long:
-            if total_short > self.entry_threshold or total_long < self.exit_threshold:
+            # Exit if long score collapsed OR short score dominates
+            if total_long < self.exit_threshold or total_short > exit_flip_threshold:
                 result.signals.append(MicroSignal.CLOSE_LONG)
                 result.reasons.append(
                     f"Close long: L={total_long:.2f} < {self.exit_threshold} "
-                    f"or S={total_short:.2f} > {self.entry_threshold}"
+                    f"or S={total_short:.2f} > {exit_flip_threshold:.2f}"
                 )
 
         if has_short:
-            if total_long > self.entry_threshold or total_short < self.exit_threshold:
+            if total_short < self.exit_threshold or total_long > exit_flip_threshold:
                 result.signals.append(MicroSignal.CLOSE_SHORT)
                 result.reasons.append(
                     f"Close short: S={total_short:.2f} < {self.exit_threshold} "
-                    f"or L={total_long:.2f} > {self.entry_threshold}"
+                    f"or L={total_long:.2f} > {exit_flip_threshold:.2f}"
                 )
 
         # --- ENTRY FILTERS ---
@@ -202,14 +237,24 @@ class MicroScalper:
                 )
             return result
 
-        # v2: Trend filter — block counter-trend entries when trend is strong
+        # v4: Trend filter — block counter-trend entries more aggressively.
+        # Old ADX threshold of 30 missed most downtrends (ADX 20-28 = unfiltered).
+        # Now block at adx_trend_threshold (22) AND also block when EMA trend is
+        # clearly established even at lower ADX.
         allow_long = True
         allow_short = True
-        if self.use_trend_filter and adx > self.adx_trend_threshold:
-            if trend == "down":
-                allow_long = False
-            elif trend == "up":
-                allow_short = False
+        if self.use_trend_filter:
+            if adx > self.adx_trend_threshold:
+                if trend == "down":
+                    allow_long = False
+                elif trend == "up":
+                    allow_short = False
+            # v4: Even in "ranging" ADX, if EMA trend is clear, block counter-trend
+            elif adx > self.adx_range_threshold and trend != "neutral":
+                if trend == "down":
+                    allow_long = False
+                elif trend == "up":
+                    allow_short = False
 
         # --- ENTRY LOGIC ---
         if not has_long and allow_long and total_long >= self.entry_threshold:

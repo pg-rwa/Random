@@ -1,4 +1,4 @@
-# BTC Micro-Trading Bot v2 Configuration
+# BTC Micro-Trading Bot v4 Configuration
 # Multi-signal weighted scorer on 1m candles
 # Paper trading on mainnet prices — no real money at risk
 
@@ -18,10 +18,11 @@ strategy:
   weight_macd: 0.25              # MACD histogram momentum
   weight_bb: 0.15                # Bollinger Band position
 
-  # v2: Lowered entry/exit thresholds for more frequent micro trades
+  # v4: Balanced thresholds — entry_threshold stays at 0.38 but spread
+  # requirement raised to 0.10 so only clear directional signals enter.
   entry_threshold: 0.38          # v2: was 0.55 — nearly impossible to reach
   exit_threshold: 0.20           # v2: was 0.30
-  min_score_spread: 0.05         # v2: was 0.10 — too restrictive
+  min_score_spread: 0.10         # v4: raised from 0.05 — need clearer direction
 
   # RSI params (v2: widened zones)
   rsi_oversold: 35.0             # v2: was 30.0
@@ -47,10 +48,10 @@ strategy:
   # Other indicator periods
   rsi_period: 14
 
-  # v2: Trend filter
+  # v4: Trend filter — more aggressive counter-trend blocking
   use_trend_filter: true         # Block counter-trend entries on strong trends
-  adx_range_threshold: 25.0      # ADX below this = ranging market
-  adx_trend_threshold: 30.0      # ADX above this = strong trend
+  adx_range_threshold: 20.0      # v4: lowered from 25 — catch weaker trends too
+  adx_trend_threshold: 22.0      # v4: lowered from 30 — 30 missed most downtrends
   max_atr_pct: 0.3               # Skip entries when ATR% too high
 
 # Executor parameters — micro-trade sizing & risk
