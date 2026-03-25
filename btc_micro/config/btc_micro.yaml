@@ -1,108 +1,81 @@
-# BTC Micro-Trading Bot v4 Configuration
-# Multi-signal weighted scorer on 1m candles
+# BTC Micro-Trading Bot v5 Configuration
+# Pattern-based strategies + SQLite database
 # Paper trading on mainnet prices — no real money at risk
 
 symbol: "BTC"
 interval: "1m"
 candle_limit: 100
-loop_interval_seconds: 20        # v2: Faster checks (was 30)
-leverage: 5                      # Conservative for BTC volatility
+loop_interval_seconds: 20
+leverage: 5
+db_path: "btc_trades/btc_micro.db"
 
-# Strategy parameters — multi-signal weighted scorer
+# Strategy parameters — proven pattern-based strategies
 strategy:
-  # Signal weights (should roughly sum to 1.0)
-  weight_rsi: 0.20               # RSI extreme bounce detection
-  weight_vwap: 0.15              # VWAP deviation mean-reversion
-  weight_ema: 0.15               # EMA micro-cross on 1m
-  weight_volume: 0.10            # Volume spike confirmation
-  weight_macd: 0.25              # MACD histogram momentum
-  weight_bb: 0.15                # Bollinger Band position
+  # Minimum confidence to act on any strategy signal
+  min_confidence: 0.50
 
-  # v4: Balanced thresholds — entry_threshold stays at 0.38 but spread
-  # requirement raised to 0.10 so only clear directional signals enter.
-  entry_threshold: 0.38          # v2: was 0.55 — nearly impossible to reach
-  exit_threshold: 0.20           # v2: was 0.30
-  min_score_spread: 0.10         # v4: raised from 0.05 — need clearer direction
+  # ATR volatility gate — skip entries when too volatile
+  max_atr_pct: 0.3
 
-  # RSI params (v2: widened zones)
-  rsi_oversold: 35.0             # v2: was 30.0
-  rsi_overbought: 65.0           # v2: was 70.0
-
-  # VWAP deviation (% from VWAP considered "stretched")
-  vwap_deviation_pct: 0.12       # v2: slightly tighter
-
-  # Volume spike multiplier (v2: more sensitive)
-  volume_spike_mult: 1.3         # v2: was 1.5
-
-  # Bollinger Band params
-  bb_period: 20
-  bb_std: 2.0
-  bb_squeeze_width_pct: 0.30     # BB width below this = squeeze
-  min_bb_width_pct: 0.08         # Skip entries when BB too tight
-
-  # EMA periods
+  # EMA periods (used by all strategies for trend context)
   ema_fast: 8
   ema_slow: 21
-  ema_trend: 50                  # v2: EMA50 for trend detection
-
-  # Other indicator periods
+  ema_trend: 50
   rsi_period: 14
+  bb_period: 20
+  bb_std: 2.0
 
-  # v4: Trend filter — more aggressive counter-trend blocking
-  use_trend_filter: true         # Block counter-trend entries on strong trends
-  adx_range_threshold: 20.0      # v4: lowered from 25 — catch weaker trends too
-  adx_trend_threshold: 22.0      # v4: lowered from 30 — 30 missed most downtrends
-  max_atr_pct: 0.3               # Skip entries when ATR% too high
+  # Exit thresholds
+  exit_rsi_long: 75              # Exit longs when RSI > this
+  exit_rsi_short: 25             # Exit shorts when RSI < this
+
+  # --- VWAP Reclaim Strategy ---
+  enable_vwap_reclaim: true
+  vwap_min_volume_ratio: 1.2     # Volume must be 1.2x average
+  vwap_min_deviation_pct: 0.03   # Minimum deviation from VWAP
+  vwap_max_deviation_pct: 0.15   # Max deviation (not too stretched)
+
+  # --- Fair Value Gap (FVG) Strategy ---
+  enable_fvg: true
+  fvg_min_gap_pct: 0.03          # Minimum gap size (% of price)
+  fvg_max_gap_pct: 0.25          # Max gap size
+  fvg_lookback: 15               # How many candles back to scan for FVGs
+
+  # --- Break of Structure (BOS) Strategy ---
+  enable_bos: true
+  bos_swing_lookback: 10         # Candles to look back for swing points
+  bos_min_break_pct: 0.02        # Minimum break distance
+  bos_max_break_pct: 0.15        # Max break distance (not a wick spike)
+  bos_volume_confirm: 1.1        # Volume confirmation for breaks
+
+  # --- EMA Pullback Strategy ---
+  enable_ema_pullback: true
+  ema_touch_tolerance_pct: 0.04  # How close price must get to EMA21
+  ema_rsi_upper: 70              # Don't buy when RSI this high
+  ema_rsi_lower: 30              # Don't short when RSI this low
 
 # Executor parameters — micro-trade sizing & risk
 executor:
-  tp_pct: 0.15                   # v3: widened from 0.08% — was too tight, all trades stopped out
-  sl_pct: 0.12                   # v3: widened from 0.06% — BTC 1m noise exceeds 0.06%
-  position_size_usd: 40.0        # v2: Smaller micro positions ($40 × 5x = $200 notional)
+  tp_pct: 0.15                   # Take-profit target
+  sl_pct: 0.12                   # Stop-loss
+  position_size_usd: 40.0        # $40 x 5x = $200 notional per trade
   max_consecutive_losses: 4      # Pause after 4 losses
-  cooldown_after_losses_sec: 120 # v2: 2 min cooldown (was 3 min)
-  daily_loss_limit_pct: 2.0      # Stop if down 2% of equity
-  direction_cooldown_sec: 45     # v2: 45s between same-direction entries (was 60)
-  max_trades_per_hour: 30        # v2: More trades allowed (was 20)
+  cooldown_after_losses_sec: 120
+  daily_loss_limit_pct: 2.0
+  direction_cooldown_sec: 45
+  max_trades_per_hour: 30
 
-  # v2: ATR-based dynamic stops
-  use_atr_stops: true            # Use ATR for dynamic TP/SL
-  atr_tp_mult: 2.5               # v3: widened from 1.5 — give trades room to reach TP
-  atr_sl_mult: 1.8               # v3: widened from 1.0 — 1x ATR = instant stop-outs on BTC
+  # ATR-based dynamic stops
+  use_atr_stops: true
+  atr_tp_mult: 2.5               # TP = 2.5x ATR
+  atr_sl_mult: 1.8               # SL = 1.8x ATR
 
-  # v2: Trailing stop
-  trailing_stop_activate_pct: 0.10  # v3: widened from 0.05% — activate after meaningful profit
-  trailing_stop_distance_pct: 0.06  # v3: widened from 0.03% — don't get shaken out by noise
+  # Trailing stop
+  trailing_stop_activate_pct: 0.10
+  trailing_stop_distance_pct: 0.06
 
-  # v2: Session drawdown circuit breaker
-  session_drawdown_limit_pct: 3.0   # Pause if session down 3%
-
-  # v2: Per-direction loss tracking
-  per_direction_loss_limit: 3       # Pause direction after 3 same-direction losses
-  per_direction_cooldown_sec: 120   # 2 min per-direction cooldown
-
-  # v2: Scale down on losing streaks
-  scale_size_on_streak: true        # Reduce size after consecutive losses
-
-# Self-learner — adapts parameters from trade history
-learner:
-  enabled: true
-  log_dir: "btc_trades"
-  lookback_days: 7
-  review_every_n_trades: 10      # v2: Faster reviews (was 15)
-  min_trades_to_learn: 15        # v2: Lower bar (was 25)
-  learning_rate: 0.25            # v2: Faster adaptation (was 0.20)
-  enable_time_filter: true       # Block unprofitable hours
-  enable_direction_filter: true  # Disable losing direction
-  enable_tp_sl_tuning: true      # Adjust TP/SL from exit analysis
-  enable_confidence_gate: true   # Raise min confidence when losing
-  enable_weight_tuning: true     # Optimize signal weights (BTC-specific)
-  enable_volatility_regime: true # Adapt to BTC vol regimes
-
-  # v2: Kill switch
-  enable_kill_switch: true       # Auto-pause on extreme losses
-  kill_switch_loss_streak: 6     # Pause after 6 consecutive losses
-  kill_switch_drawdown_pct: 1.5  # Pause at 1.5% session drawdown
-
-  # v2: ATR stop tuning
-  enable_atr_stop_tuning: true   # Tune ATR multipliers from trade data
+  # Circuit breakers
+  session_drawdown_limit_pct: 3.0
+  per_direction_loss_limit: 3
+  per_direction_cooldown_sec: 120
+  scale_size_on_streak: true

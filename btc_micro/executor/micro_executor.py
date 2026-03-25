@@ -38,6 +38,7 @@ class MicroExecutor:
         max_trades_per_hour: int = 20,
         log_dir: str = "btc_trades",
         learner=None,
+        db=None,  # v5: SQLite database
         # v2: New params
         use_atr_stops: bool = True,
         atr_tp_mult: float = 1.5,
@@ -87,6 +88,9 @@ class MicroExecutor:
         # Auto-learner
         self._learner = learner
         self._confidence_min: float = 0.0
+
+        # v5: SQLite database
+        self._db = db
 
         # v3: Per-trade self-learning analyzer
         self._per_trade = PerTradeAnalyzer(
@@ -316,6 +320,7 @@ class MicroExecutor:
             "mode": "paper",
             "status": "closed",
             "atr_at_entry": pos.get("atr_at_entry", 0),
+            "strategy": pos.get("strategy", ""),
         }
 
         # Update risk tracking
@@ -372,6 +377,13 @@ class MicroExecutor:
 
         self._trade_log.append(trade_record)
         self._persist_trade(trade_record)
+
+        # v5: Log to SQLite database
+        if self._db:
+            try:
+                self._db.insert_trade(trade_record)
+            except Exception as e:
+                logger.warning("DB insert failed: %s", e)
 
         # v3: Record in per-trade analyzer for real-time learning
         self._per_trade.record_trade(
@@ -516,6 +528,7 @@ class MicroExecutor:
             "atr_at_entry": atr,
             "confidence": signals.confidence,  # v3: for per-trade learning
             "trend": signals.trend,            # v3: for per-trade learning
+            "strategy": getattr(signals, "strategy", ""),  # v5: track which strategy
         }
 
         trade_record = {
@@ -534,6 +547,7 @@ class MicroExecutor:
             "short_score": signals.short_score,
             "trend": signals.trend,
             "reasons": signals.reasons,
+            "strategy": getattr(signals, "strategy", ""),
             "atr": atr,
             "mode": "paper" if self.paper_trade else "live",
             "status": "filled",
@@ -584,6 +598,14 @@ class MicroExecutor:
         self._trade_log.append(trade_record)
         self._persist_trade(trade_record)
         self._hour_trade_timestamps.append(time.time())
+
+        # v5: Log to SQLite database
+        if self._db:
+            try:
+                self._db.insert_trade(trade_record)
+            except Exception as e:
+                logger.warning("DB insert failed: %s", e)
+
         return trade_record
 
     def _persist_trade(self, trade: dict) -> None:

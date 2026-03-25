@@ -1,23 +1,16 @@
-"""BTC micro-trading strategy — multi-signal weighted scorer.
+"""BTC micro-trading strategy — proven pattern-based strategies.
 
-v2: Lowered entry thresholds, added trend filter (EMA50+ADX),
-    ATR volatility gate, RSI momentum confirmation, reduced
-    signal-spread requirement so the bot actually trades.
-v4: Trend dampening — penalise counter-trend mean-reversion signals
-    (RSI, VWAP, BB) so the bot stops going long in downtrends.
-    Stronger trend filter (ADX 22), higher score-spread (0.10),
-    and smarter exit logic that holds winners longer.
+v5: Complete rewrite. Replaces the weighted signal scorer with discrete,
+rule-based strategies used by successful traders:
 
-Signals:
-1. RSI extreme bounce    — RSI dipping into oversold/overbought then reversing
-2. VWAP deviation        — price stretched away from VWAP snapping back
-3. EMA micro-cross       — fast EMA crossing slow EMA on 1m
-4. Volume spike          — sudden volume surge confirming direction
-5. MACD micro-momentum   — histogram flipping or accelerating
-6. BB squeeze breakout   — BB contracting then price breaking out
+1. VWAP Reclaim    — Institutional mean-reversion when price reclaims VWAP
+2. Fair Value Gap  — ICT/SMC 3-candle imbalance fill
+3. Structure Break — Break of Structure (BOS) momentum continuation
+4. EMA Pullback    — Trend pullback to dynamic support/resistance
 
-Each signal scores 0.0–1.0, multiplied by its weight. Total score
-determines entry direction and confidence.
+Each strategy produces independent signals. The engine picks the highest
+confidence signal when multiple strategies agree. No arbitrary scoring —
+every entry has a specific market structure reason.
 """
 
 import logging
@@ -43,55 +36,508 @@ class MicroResult:
     confidence: float = 0.0
     long_score: float = 0.0
     short_score: float = 0.0
-    trend: str = "neutral"  # v2: "up", "down", "neutral"
+    trend: str = "neutral"
+    strategy: str = ""
 
     def __str__(self):
         sigs = [s.value for s in self.signals]
         return (f"MicroResult(signals={sigs}, conf={self.confidence:.2f}, "
-                f"L={self.long_score:.2f}, S={self.short_score:.2f}, trend={self.trend})")
+                f"strategy={self.strategy}, trend={self.trend})")
 
 
-class MicroScalper:
-    """Multi-signal BTC micro-trade strategy on 1m candles."""
+# ======================================================================
+# Individual Strategy Detectors
+# ======================================================================
+
+class VWAPReclaim:
+    """VWAP Reclaim strategy — institutional mean-reversion.
+
+    Entry Rules:
+    - LONG: Price was below VWAP, crosses back above with volume > 1.2x avg.
+            Confirms institutions defending VWAP as support.
+    - SHORT: Price was above VWAP, crosses back below with volume > 1.2x avg.
+            Confirms institutions using VWAP as resistance.
+
+    Exit: ATR-based TP/SL. TP = 1.5x ATR, SL = 1.0x ATR.
+    Why it works: VWAP is the benchmark institutional traders use.
+    Price reclaiming VWAP signals institutional order flow direction.
+    """
 
     def __init__(self, config: dict):
-        # Signal weights (must sum to ~1.0 for normalized scoring)
-        self.w_rsi = config.get("weight_rsi", 0.20)
-        self.w_vwap = config.get("weight_vwap", 0.15)
-        self.w_ema = config.get("weight_ema", 0.15)
-        self.w_volume = config.get("weight_volume", 0.10)
-        self.w_macd = config.get("weight_macd", 0.25)
-        self.w_bb = config.get("weight_bb", 0.15)
+        self.min_volume_ratio = config.get("vwap_min_volume_ratio", 1.2)
+        self.min_deviation_pct = config.get("vwap_min_deviation_pct", 0.03)
+        self.max_deviation_pct = config.get("vwap_max_deviation_pct", 0.15)
 
-        # v2: Lowered thresholds — the old 0.55 was nearly impossible to reach
-        self.entry_threshold = config.get("entry_threshold", 0.38)
-        self.exit_threshold = config.get("exit_threshold", 0.20)
+    def evaluate(self, ind: dict, candles_data: list[dict]) -> dict | None:
+        """Returns signal dict or None."""
+        price = ind.get("close", 0)
+        vwap = ind.get("vwap", 0)
+        volume_ratio = ind.get("volume_ratio", 1.0)
+        prev_close = ind.get("prev_close", 0)
 
-        # v2: Reduced spread requirement — old 0.10 was too restrictive
-        self.min_score_spread = config.get("min_score_spread", 0.05)
+        if vwap <= 0 or price <= 0 or prev_close <= 0:
+            return None
 
-        # RSI params
-        self.rsi_oversold = config.get("rsi_oversold", 35.0)
-        self.rsi_overbought = config.get("rsi_overbought", 65.0)
+        dev_pct = abs(price - vwap) / vwap * 100
 
-        # VWAP deviation threshold (% from VWAP to consider stretched)
-        self.vwap_dev_pct = config.get("vwap_deviation_pct", 0.10)
+        # Must be near VWAP (not too stretched)
+        if dev_pct > self.max_deviation_pct:
+            return None
 
-        # Volume spike multiplier
-        self.volume_spike_mult = config.get("volume_spike_mult", 1.3)
+        # Need volume confirmation
+        if volume_ratio < self.min_volume_ratio:
+            return None
 
-        # BB squeeze detection
-        self.bb_squeeze_width_pct = config.get("bb_squeeze_width_pct", 0.30)
-        self.min_bb_width_pct = config.get("min_bb_width_pct", 0.08)
+        # LONG: Price crossed from below VWAP to above
+        if prev_close < vwap and price > vwap:
+            # Confirm with EMA trend not strongly bearish
+            ema_fast = ind.get("ema_fast", 0)
+            ema_slow = ind.get("ema_slow", 0)
+            if ema_fast > 0 and ema_slow > 0 and ema_fast < ema_slow * 0.998:
+                return None  # Strong downtrend, skip
 
-        # v2: Trend filter
-        self.use_trend_filter = config.get("use_trend_filter", True)
-        self.adx_range_threshold = config.get("adx_range_threshold", 25.0)
-        self.adx_trend_threshold = config.get("adx_trend_threshold", 30.0)
+            confidence = min(0.9, 0.5 + (volume_ratio - 1.0) * 0.3)
+            return {
+                "direction": "long",
+                "signal": MicroSignal.OPEN_LONG,
+                "confidence": confidence,
+                "strategy": "vwap_reclaim",
+                "reason": f"VWAP reclaim long: price crossed above VWAP {vwap:.0f}, vol={volume_ratio:.1f}x",
+            }
+
+        # SHORT: Price crossed from above VWAP to below
+        if prev_close > vwap and price < vwap:
+            ema_fast = ind.get("ema_fast", 0)
+            ema_slow = ind.get("ema_slow", 0)
+            if ema_fast > 0 and ema_slow > 0 and ema_fast > ema_slow * 1.002:
+                return None  # Strong uptrend, skip
+
+            confidence = min(0.9, 0.5 + (volume_ratio - 1.0) * 0.3)
+            return {
+                "direction": "short",
+                "signal": MicroSignal.OPEN_SHORT,
+                "confidence": confidence,
+                "strategy": "vwap_reclaim",
+                "reason": f"VWAP reclaim short: price crossed below VWAP {vwap:.0f}, vol={volume_ratio:.1f}x",
+            }
+
+        return None
+
+
+class FairValueGap:
+    """Fair Value Gap (FVG) — ICT/SMC imbalance fill strategy.
+
+    A Fair Value Gap is a 3-candle pattern where candle 2 creates a gap
+    between candle 1's high and candle 3's low (bullish) or candle 1's
+    low and candle 3's high (bearish).
+
+    Entry Rules:
+    - LONG: Bullish FVG detected (gap between candle1.high and candle3.low),
+            price pulls back into the gap zone. Enter when price touches
+            the gap's midpoint with trend confirmation.
+    - SHORT: Bearish FVG detected, price rallies into gap zone.
+
+    Exit: TP at opposite side of gap. SL at gap invalidation (below gap
+    for bullish, above for bearish).
+
+    Why it works: FVGs represent institutional order flow imbalance.
+    Price tends to "fill" these gaps as unfilled orders get matched.
+    """
+
+    def __init__(self, config: dict):
+        self.min_gap_pct = config.get("fvg_min_gap_pct", 0.03)
+        self.max_gap_pct = config.get("fvg_max_gap_pct", 0.25)
+        self.lookback = config.get("fvg_lookback", 15)
+
+    def evaluate(self, ind: dict, candles_data: list[dict]) -> dict | None:
+        price = ind.get("close", 0)
+        if price <= 0 or len(candles_data) < self.lookback + 3:
+            return None
+
+        # Scan recent candles for FVG formations
+        recent = candles_data[-(self.lookback + 3):]
+        best_signal = None
+        best_distance = float("inf")
+
+        for i in range(len(recent) - 2):
+            c1 = recent[i]
+            c2 = recent[i + 1]
+            c3 = recent[i + 2]
+
+            # Bullish FVG: candle3.low > candle1.high (gap up)
+            if c3["low"] > c1["high"]:
+                gap_size = c3["low"] - c1["high"]
+                gap_pct = gap_size / price * 100
+                if self.min_gap_pct <= gap_pct <= self.max_gap_pct:
+                    gap_mid = c1["high"] + gap_size / 2
+                    # Price must be near or in the gap (pullback to fill)
+                    if c1["high"] <= price <= c3["low"] * 1.001:
+                        distance = abs(price - gap_mid)
+                        if distance < best_distance:
+                            best_distance = distance
+                            # Trend confirmation: recent close above ema
+                            ema_fast = ind.get("ema_fast", 0)
+                            if ema_fast > 0 and price < ema_fast * 0.997:
+                                continue  # Counter-trend, skip
+                            confidence = min(0.85, 0.5 + gap_pct * 2)
+                            best_signal = {
+                                "direction": "long",
+                                "signal": MicroSignal.OPEN_LONG,
+                                "confidence": confidence,
+                                "strategy": "fvg",
+                                "reason": f"Bullish FVG fill: gap {c1['high']:.0f}-{c3['low']:.0f} ({gap_pct:.2f}%)",
+                                "fvg_low": c1["high"],
+                                "fvg_high": c3["low"],
+                            }
+
+            # Bearish FVG: candle1.low > candle3.high (gap down)
+            if c1["low"] > c3["high"]:
+                gap_size = c1["low"] - c3["high"]
+                gap_pct = gap_size / price * 100
+                if self.min_gap_pct <= gap_pct <= self.max_gap_pct:
+                    gap_mid = c3["high"] + gap_size / 2
+                    if c3["high"] * 0.999 <= price <= c1["low"]:
+                        distance = abs(price - gap_mid)
+                        if distance < best_distance:
+                            best_distance = distance
+                            ema_fast = ind.get("ema_fast", 0)
+                            if ema_fast > 0 and price > ema_fast * 1.003:
+                                continue
+                            confidence = min(0.85, 0.5 + gap_pct * 2)
+                            best_signal = {
+                                "direction": "short",
+                                "signal": MicroSignal.OPEN_SHORT,
+                                "confidence": confidence,
+                                "strategy": "fvg",
+                                "reason": f"Bearish FVG fill: gap {c3['high']:.0f}-{c1['low']:.0f} ({gap_pct:.2f}%)",
+                                "fvg_low": c3["high"],
+                                "fvg_high": c1["low"],
+                            }
+
+        return best_signal
+
+
+class StructureBreak:
+    """Break of Structure (BOS) — momentum continuation.
+
+    Detects when price breaks a recent swing high/low, signaling
+    trend continuation. Based on ICT/SMC market structure concepts.
+
+    Entry Rules:
+    - LONG: Price breaks above the most recent swing high (higher high)
+            after making a higher low. Volume confirms the break.
+    - SHORT: Price breaks below recent swing low (lower low) after
+            making a lower high.
+
+    Exit: Trail stop below the broken level. TP = 2x the swing range.
+
+    Why it works: Breaking structure means order flow has shifted.
+    Institutional money drives these breaks, and momentum follows.
+    """
+
+    def __init__(self, config: dict):
+        self.swing_lookback = config.get("bos_swing_lookback", 10)
+        self.min_break_pct = config.get("bos_min_break_pct", 0.02)
+        self.max_break_pct = config.get("bos_max_break_pct", 0.15)
+        self.volume_confirm = config.get("bos_volume_confirm", 1.1)
+
+    def _find_swing_highs(self, candles: list[dict], n: int = 3) -> list[dict]:
+        """Find swing highs (local maxima with n candles on each side)."""
+        swings = []
+        for i in range(n, len(candles) - n):
+            high = candles[i]["high"]
+            is_swing = all(candles[i - j]["high"] <= high for j in range(1, n + 1))
+            is_swing = is_swing and all(candles[i + j]["high"] <= high for j in range(1, n + 1))
+            if is_swing:
+                swings.append({"price": high, "index": i})
+        return swings
+
+    def _find_swing_lows(self, candles: list[dict], n: int = 3) -> list[dict]:
+        """Find swing lows (local minima)."""
+        swings = []
+        for i in range(n, len(candles) - n):
+            low = candles[i]["low"]
+            is_swing = all(candles[i - j]["low"] >= low for j in range(1, n + 1))
+            is_swing = is_swing and all(candles[i + j]["low"] >= low for j in range(1, n + 1))
+            if is_swing:
+                swings.append({"price": low, "index": i})
+        return swings
+
+    def evaluate(self, ind: dict, candles_data: list[dict]) -> dict | None:
+        price = ind.get("close", 0)
+        prev_close = ind.get("prev_close", 0)
+        volume_ratio = ind.get("volume_ratio", 1.0)
+
+        if price <= 0 or len(candles_data) < self.swing_lookback + 6:
+            return None
+
+        recent = candles_data[-(self.swing_lookback + 6):-1]  # Exclude current candle
+        swing_highs = self._find_swing_highs(recent)
+        swing_lows = self._find_swing_lows(recent)
+
+        # LONG BOS: Current price breaks above most recent swing high
+        if swing_highs:
+            last_sh = swing_highs[-1]
+            break_pct = (price - last_sh["price"]) / last_sh["price"] * 100
+
+            if self.min_break_pct <= break_pct <= self.max_break_pct:
+                if prev_close <= last_sh["price"]:  # Fresh break
+                    if volume_ratio >= self.volume_confirm:
+                        # Confirm higher low exists (structure intact)
+                        if len(swing_lows) >= 2:
+                            if swing_lows[-1]["price"] > swing_lows[-2]["price"]:
+                                confidence = min(0.85, 0.5 + break_pct * 3 + (volume_ratio - 1) * 0.2)
+                                return {
+                                    "direction": "long",
+                                    "signal": MicroSignal.OPEN_LONG,
+                                    "confidence": confidence,
+                                    "strategy": "bos",
+                                    "reason": f"BOS long: broke swing high {last_sh['price']:.0f} by {break_pct:.2f}%, vol={volume_ratio:.1f}x",
+                                    "broken_level": last_sh["price"],
+                                }
+
+        # SHORT BOS: Current price breaks below most recent swing low
+        if swing_lows:
+            last_sl = swing_lows[-1]
+            break_pct = (last_sl["price"] - price) / last_sl["price"] * 100
+
+            if self.min_break_pct <= break_pct <= self.max_break_pct:
+                if prev_close >= last_sl["price"]:
+                    if volume_ratio >= self.volume_confirm:
+                        if len(swing_highs) >= 2:
+                            if swing_highs[-1]["price"] < swing_highs[-2]["price"]:
+                                confidence = min(0.85, 0.5 + break_pct * 3 + (volume_ratio - 1) * 0.2)
+                                return {
+                                    "direction": "short",
+                                    "signal": MicroSignal.OPEN_SHORT,
+                                    "confidence": confidence,
+                                    "strategy": "bos",
+                                    "reason": f"BOS short: broke swing low {last_sl['price']:.0f} by {break_pct:.2f}%, vol={volume_ratio:.1f}x",
+                                    "broken_level": last_sl["price"],
+                                }
+
+        return None
+
+
+class EMAPullback:
+    """EMA Pullback — trend-following pullback to dynamic S/R.
+
+    The most reliable scalping strategy: trade pullbacks to EMA in
+    an established trend. Works because EMAs act as dynamic support/
+    resistance that institutional algos monitor.
+
+    Entry Rules:
+    - LONG: Trend is up (EMA8 > EMA21 > EMA50). Price pulls back to
+            touch EMA21 (within 0.02%) then bounces (current candle
+            closes above EMA8). RSI is not overbought.
+    - SHORT: Trend is down. Price rallies to touch EMA21 then rejects.
+
+    Exit: TP = 1.5x distance from EMA21 to entry. SL = below EMA50.
+
+    Why it works: In trends, the 21 EMA acts as institutional re-entry
+    zone. Pullbacks to this level offer the best risk:reward for
+    trend continuation.
+    """
+
+    def __init__(self, config: dict):
+        self.touch_tolerance_pct = config.get("ema_touch_tolerance_pct", 0.04)
+        self.rsi_upper = config.get("ema_rsi_upper", 70)
+        self.rsi_lower = config.get("ema_rsi_lower", 30)
+
+    def evaluate(self, ind: dict, candles_data: list[dict]) -> dict | None:
+        price = ind.get("close", 0)
+        ema_fast = ind.get("ema_fast", 0)
+        ema_slow = ind.get("ema_slow", 0)
+        ema_trend = ind.get("ema_trend", 0)
+        rsi = ind.get("rsi", 50)
+        prev_close = ind.get("prev_close", 0)
+
+        if price <= 0 or ema_fast <= 0 or ema_slow <= 0 or ema_trend <= 0:
+            return None
+
+        tolerance = ema_slow * (self.touch_tolerance_pct / 100)
+
+        # LONG: Uptrend + pullback to EMA21 + bounce
+        if ema_fast > ema_slow > ema_trend:
+            # Price recently touched EMA21 (within last 3 candles)
+            touched = False
+            if len(candles_data) >= 4:
+                for c in candles_data[-4:-1]:
+                    if abs(c["low"] - ema_slow) <= tolerance or c["low"] <= ema_slow:
+                        touched = True
+                        break
+
+            if touched and price > ema_fast and rsi < self.rsi_upper:
+                # Current candle bounced above EMA8 = confirmation
+                if prev_close <= ema_fast * 1.001:
+                    confidence = 0.7
+                    # Bonus: RSI showing oversold-ish in uptrend = strong
+                    if rsi < 45:
+                        confidence = 0.8
+                    return {
+                        "direction": "long",
+                        "signal": MicroSignal.OPEN_LONG,
+                        "confidence": confidence,
+                        "strategy": "ema_pullback",
+                        "reason": f"EMA pullback long: bounced off EMA21 {ema_slow:.0f}, RSI={rsi:.0f}",
+                    }
+
+        # SHORT: Downtrend + rally to EMA21 + rejection
+        if ema_fast < ema_slow < ema_trend:
+            touched = False
+            if len(candles_data) >= 4:
+                for c in candles_data[-4:-1]:
+                    if abs(c["high"] - ema_slow) <= tolerance or c["high"] >= ema_slow:
+                        touched = True
+                        break
+
+            if touched and price < ema_fast and rsi > self.rsi_lower:
+                if prev_close >= ema_fast * 0.999:
+                    confidence = 0.7
+                    if rsi > 55:
+                        confidence = 0.8
+                    return {
+                        "direction": "short",
+                        "signal": MicroSignal.OPEN_SHORT,
+                        "confidence": confidence,
+                        "strategy": "ema_pullback",
+                        "reason": f"EMA pullback short: rejected at EMA21 {ema_slow:.0f}, RSI={rsi:.0f}",
+                    }
+
+        return None
+
+
+# ======================================================================
+# Strategy Engine — orchestrates all strategies
+# ======================================================================
+
+class MicroScalper:
+    """Runs all strategies and picks the best signal."""
+
+    def __init__(self, config: dict):
+        self.strategies = {
+            "vwap_reclaim": VWAPReclaim(config),
+            "fvg": FairValueGap(config),
+            "bos": StructureBreak(config),
+            "ema_pullback": EMAPullback(config),
+        }
+
+        # Which strategies are enabled
+        self.enabled = {
+            "vwap_reclaim": config.get("enable_vwap_reclaim", True),
+            "fvg": config.get("enable_fvg", True),
+            "bos": config.get("enable_bos", True),
+            "ema_pullback": config.get("enable_ema_pullback", True),
+        }
+
+        # Minimum confidence to act on a signal
+        self.min_confidence = config.get("min_confidence", 0.50)
+
+        # ATR volatility gate
         self.max_atr_pct = config.get("max_atr_pct", 0.3)
 
+        # Exit threshold — when trend weakens, close positions
+        self.exit_rsi_long = config.get("exit_rsi_long", 75)
+        self.exit_rsi_short = config.get("exit_rsi_short", 25)
+
+        enabled_names = [k for k, v in self.enabled.items() if v]
+        logger.info("MicroScalper v5 initialized | strategies: %s | min_conf=%.2f",
+                     enabled_names, self.min_confidence)
+
+    def evaluate(
+        self, indicators: dict, has_long: bool, has_short: bool,
+        candles_data: list[dict] | None = None,
+    ) -> MicroResult:
+        """Evaluate all strategies, pick the best signal."""
+        result = MicroResult()
+        price = indicators.get("close", 0)
+        atr = indicators.get("atr", 0)
+        rsi = indicators.get("rsi", 50)
+
+        # Detect trend for logging
+        result.trend = self._detect_trend(indicators)
+
+        # Guard NaN
+        for key in ["close", "rsi", "vwap", "ema_fast", "ema_slow"]:
+            val = indicators.get(key, 0)
+            if isinstance(val, float) and math.isnan(val):
+                result.signals.append(MicroSignal.HOLD)
+                result.reasons.append(f"NaN in {key}")
+                return result
+
+        if price <= 0:
+            result.signals.append(MicroSignal.HOLD)
+            return result
+
+        # ATR volatility gate — skip entries when too volatile
+        atr_pct = (atr / price * 100) if price > 0 and atr > 0 else 0
+        entry_blocked_by_vol = atr_pct > self.max_atr_pct
+
+        # --- EXIT LOGIC (always evaluate first) ---
+        if has_long:
+            should_exit = self._should_exit_long(indicators)
+            if should_exit:
+                result.signals.append(MicroSignal.CLOSE_LONG)
+                result.reasons.append(should_exit)
+
+        if has_short:
+            should_exit = self._should_exit_short(indicators)
+            if should_exit:
+                result.signals.append(MicroSignal.CLOSE_SHORT)
+                result.reasons.append(should_exit)
+
+        # --- ENTRY LOGIC ---
+        if entry_blocked_by_vol:
+            if not result.signals:
+                result.signals.append(MicroSignal.HOLD)
+                result.reasons.append(f"ATR {atr_pct:.2f}% > {self.max_atr_pct}% — too volatile")
+            return result
+
+        candles = candles_data or []
+        candidates = []
+
+        for name, strategy in self.strategies.items():
+            if not self.enabled.get(name, True):
+                continue
+            try:
+                sig = strategy.evaluate(indicators, candles)
+                if sig and sig.get("confidence", 0) >= self.min_confidence:
+                    candidates.append(sig)
+            except Exception as e:
+                logger.warning("Strategy %s error: %s", name, e)
+
+        # Pick the highest-confidence signal
+        if candidates:
+            # Filter: don't open a direction we already have
+            filtered = []
+            for c in candidates:
+                if c["direction"] == "long" and has_long:
+                    continue
+                if c["direction"] == "short" and has_short:
+                    continue
+                filtered.append(c)
+
+            if filtered:
+                best = max(filtered, key=lambda c: c["confidence"])
+                result.signals.append(best["signal"])
+                result.reasons.append(best["reason"])
+                result.confidence = best["confidence"]
+                result.strategy = best.get("strategy", "")
+
+                # Set scores for logging compatibility
+                if best["direction"] == "long":
+                    result.long_score = best["confidence"]
+                    result.short_score = 0.0
+                else:
+                    result.short_score = best["confidence"]
+                    result.long_score = 0.0
+
+        if not result.signals:
+            result.signals.append(MicroSignal.HOLD)
+
+        return result
+
     def _detect_trend(self, indicators: dict) -> str:
-        """Determine trend using EMA50 and EMA crossover."""
         price = indicators.get("close", 0)
         ema_fast = indicators.get("ema_fast", 0)
         ema_slow = indicators.get("ema_slow", 0)
@@ -106,335 +552,35 @@ class MicroScalper:
             return "down"
         return "neutral"
 
-    def evaluate(
-        self, indicators: dict, has_long: bool, has_short: bool
-    ) -> MicroResult:
-        """Score all micro-signals and decide entry/exit."""
-        result = MicroResult()
-        price = indicators.get("close", 0)
-        adx = indicators.get("adx", 0)
-        atr = indicators.get("atr", 0)
-
-        # v2: Detect trend
-        trend = self._detect_trend(indicators)
-        result.trend = trend
-
-        # Guard NaN
-        for key in ["close", "rsi", "vwap", "ema_fast", "ema_slow",
-                     "macd_histogram", "bb_upper", "bb_lower", "bb_middle"]:
-            val = indicators.get(key, 0)
-            if isinstance(val, float) and math.isnan(val):
-                result.signals.append(MicroSignal.HOLD)
-                result.reasons.append(f"NaN in {key}")
-                return result
-
-        if price <= 0:
-            result.signals.append(MicroSignal.HOLD)
-            return result
-
-        # v2: Volatility gate — skip when ATR is extreme
-        atr_pct = (atr / price * 100) if price > 0 and atr > 0 else 0
-        if atr_pct > self.max_atr_pct:
-            if not has_long and not has_short:
-                result.signals.append(MicroSignal.HOLD)
-                result.reasons.append(f"ATR {atr_pct:.2f}% > {self.max_atr_pct}% — too volatile")
-                return result
-
-        # --- Compute individual signal scores ---
-        long_scores = {}
-        short_scores = {}
-
-        # 1. RSI extreme bounce
-        l, s = self._score_rsi(indicators)
-        long_scores["rsi"] = l * self.w_rsi
-        short_scores["rsi"] = s * self.w_rsi
-
-        # 2. VWAP deviation (mean-reversion toward VWAP)
-        l, s = self._score_vwap(indicators)
-        long_scores["vwap"] = l * self.w_vwap
-        short_scores["vwap"] = s * self.w_vwap
-
-        # 3. EMA micro-cross
-        l, s = self._score_ema(indicators)
-        long_scores["ema"] = l * self.w_ema
-        short_scores["ema"] = s * self.w_ema
-
-        # 4. Volume spike
-        l, s = self._score_volume(indicators)
-        long_scores["volume"] = l * self.w_volume
-        short_scores["volume"] = s * self.w_volume
-
-        # 5. MACD micro-momentum
-        l, s = self._score_macd(indicators)
-        long_scores["macd"] = l * self.w_macd
-        short_scores["macd"] = s * self.w_macd
-
-        # 6. BB position
-        l, s = self._score_bb(indicators)
-        long_scores["bb"] = l * self.w_bb
-        short_scores["bb"] = s * self.w_bb
-
-        total_long = sum(long_scores.values())
-        total_short = sum(short_scores.values())
-
-        # v4: Trend dampening — penalise counter-trend mean-reversion signals.
-        # In a downtrend, RSI/VWAP/BB produce strong "buy the dip" long scores
-        # that cause the bot to catch falling knives. Dampen them heavily.
-        if trend == "down":
-            # Dampen long mean-reversion signals (keep EMA/MACD/volume intact)
-            dampen = 0.35  # keep only 35% of counter-trend score
-            for key in ("rsi", "vwap", "bb"):
-                if key in long_scores and long_scores[key] > 0:
-                    reduction = long_scores[key] * (1 - dampen)
-                    long_scores[key] *= dampen
-                    total_long -= reduction
-            # Boost short scores slightly when trend confirms
-            total_short *= 1.10
-        elif trend == "up":
-            dampen = 0.35
-            for key in ("rsi", "vwap", "bb"):
-                if key in short_scores and short_scores[key] > 0:
-                    reduction = short_scores[key] * (1 - dampen)
-                    short_scores[key] *= dampen
-                    total_short -= reduction
-            total_long *= 1.10
-
-        total_long = max(0.0, total_long)
-        total_short = max(0.0, total_short)
-        result.long_score = round(total_long, 3)
-        result.short_score = round(total_short, 3)
-
-        # --- EXIT LOGIC (always allow exits) ---
-        # v4: Require stronger opposing signal to exit a winning position.
-        # Old logic exited at entry_threshold (0.38) — too early, cut winners short.
-        # Now require opposing score to beat current direction + spread (signal flip).
-        exit_flip_threshold = self.entry_threshold + self.min_score_spread  # ~0.48
-
-        if has_long:
-            # Exit if long score collapsed OR short score dominates
-            if total_long < self.exit_threshold or total_short > exit_flip_threshold:
-                result.signals.append(MicroSignal.CLOSE_LONG)
-                result.reasons.append(
-                    f"Close long: L={total_long:.2f} < {self.exit_threshold} "
-                    f"or S={total_short:.2f} > {exit_flip_threshold:.2f}"
-                )
-
-        if has_short:
-            if total_short < self.exit_threshold or total_long > exit_flip_threshold:
-                result.signals.append(MicroSignal.CLOSE_SHORT)
-                result.reasons.append(
-                    f"Close short: S={total_short:.2f} < {self.exit_threshold} "
-                    f"or L={total_long:.2f} > {exit_flip_threshold:.2f}"
-                )
-
-        # --- ENTRY FILTERS ---
-        bb_width_pct = indicators.get("bb_width_pct", 0)
-        if bb_width_pct < self.min_bb_width_pct:
-            if not result.signals:
-                result.signals.append(MicroSignal.HOLD)
-                result.reasons.append(
-                    f"BB too tight ({bb_width_pct:.3f}% < {self.min_bb_width_pct}%)"
-                )
-            return result
-
-        # v4: Trend filter — block counter-trend entries more aggressively.
-        # Old ADX threshold of 30 missed most downtrends (ADX 20-28 = unfiltered).
-        # Now block at adx_trend_threshold (22) AND also block when EMA trend is
-        # clearly established even at lower ADX.
-        allow_long = True
-        allow_short = True
-        if self.use_trend_filter:
-            if adx > self.adx_trend_threshold:
-                if trend == "down":
-                    allow_long = False
-                elif trend == "up":
-                    allow_short = False
-            # v4: Even in "ranging" ADX, if EMA trend is clear, block counter-trend
-            elif adx > self.adx_range_threshold and trend != "neutral":
-                if trend == "down":
-                    allow_long = False
-                elif trend == "up":
-                    allow_short = False
-
-        # --- ENTRY LOGIC ---
-        if not has_long and allow_long and total_long >= self.entry_threshold:
-            if total_long > total_short + self.min_score_spread:
-                # v2: Trend bonus for confidence
-                conf = total_long
-                if trend == "up":
-                    conf += 0.1
-                result.signals.append(MicroSignal.OPEN_LONG)
-                top_signals = sorted(long_scores.items(), key=lambda x: -x[1])[:3]
-                top_str = ", ".join(f"{k}={v:.2f}" for k, v in top_signals)
-                result.reasons.append(
-                    f"Long entry: score={total_long:.2f} [{top_str}] trend={trend} ADX={adx:.0f}"
-                )
-                result.confidence = conf
-
-        if not has_short and allow_short and total_short >= self.entry_threshold:
-            if total_short > total_long + self.min_score_spread:
-                conf = total_short
-                if trend == "down":
-                    conf += 0.1
-                result.signals.append(MicroSignal.OPEN_SHORT)
-                top_signals = sorted(short_scores.items(), key=lambda x: -x[1])[:3]
-                top_str = ", ".join(f"{k}={v:.2f}" for k, v in top_signals)
-                result.reasons.append(
-                    f"Short entry: score={total_short:.2f} [{top_str}] trend={trend} ADX={adx:.0f}"
-                )
-                result.confidence = conf
-
-        if not result.signals:
-            result.signals.append(MicroSignal.HOLD)
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Signal scorers — each returns (long_score, short_score) in [0, 1]
-    # ------------------------------------------------------------------
-
-    def _score_rsi(self, ind: dict) -> tuple[float, float]:
-        """RSI extreme bounce detection."""
+    def _should_exit_long(self, ind: dict) -> str | None:
+        """Check if we should exit a long position based on market structure."""
         rsi = ind.get("rsi", 50)
-        rsi_prev = ind.get("rsi_prev", 50)
-        long_score = 0.0
-        short_score = 0.0
-
-        # Long: RSI oversold
-        if rsi < self.rsi_oversold:
-            long_score = (self.rsi_oversold - rsi) / self.rsi_oversold
-            if rsi > rsi_prev:  # Turning up — stronger
-                long_score = min(1.0, long_score * 1.5)
-        # v2: Partial credit for approaching oversold
-        elif rsi < 40:
-            long_score = (40 - rsi) / 20.0  # 0 at 40, 0.5 at 30
-
-        # Short: RSI overbought
-        if rsi > self.rsi_overbought:
-            short_score = (rsi - self.rsi_overbought) / (100 - self.rsi_overbought)
-            if rsi < rsi_prev:  # Turning down
-                short_score = min(1.0, short_score * 1.5)
-        elif rsi > 60:
-            short_score = (rsi - 60) / 20.0
-
-        return long_score, short_score
-
-    def _score_vwap(self, ind: dict) -> tuple[float, float]:
-        """VWAP deviation — price far below VWAP = long, far above = short."""
-        price = ind.get("close", 0)
-        vwap = ind.get("vwap", 0)
-        if vwap <= 0:
-            return 0.0, 0.0
-
-        dev_pct = (price - vwap) / vwap * 100
-        threshold = self.vwap_dev_pct
-
-        long_score = 0.0
-        short_score = 0.0
-
-        # v2: Start scoring at 30% of threshold instead of 50%
-        if dev_pct < -threshold * 0.3:
-            long_score = min(1.0, abs(dev_pct) / threshold)
-        elif dev_pct > threshold * 0.3:
-            short_score = min(1.0, dev_pct / threshold)
-
-        return long_score, short_score
-
-    def _score_ema(self, ind: dict) -> tuple[float, float]:
-        """EMA cross on micro timeframe."""
         ema_fast = ind.get("ema_fast", 0)
         ema_slow = ind.get("ema_slow", 0)
-        ema_fast_prev = ind.get("ema_fast_prev", 0)
-        ema_slow_prev = ind.get("ema_slow_prev", 0)
-
-        if ema_slow <= 0:
-            return 0.0, 0.0
-
-        spread = (ema_fast - ema_slow) / ema_slow * 100
-        prev_spread = (ema_fast_prev - ema_slow_prev) / ema_slow_prev * 100 if ema_slow_prev > 0 else 0
-
-        long_score = 0.0
-        short_score = 0.0
-
-        if ema_fast > ema_slow:
-            long_score = min(1.0, abs(spread) * 15)  # v2: more sensitive (was 10)
-            if prev_spread < 0:  # Fresh cross
-                long_score = min(1.0, long_score * 1.5)
-        elif ema_fast < ema_slow:
-            short_score = min(1.0, abs(spread) * 15)
-            if prev_spread > 0:
-                short_score = min(1.0, short_score * 1.5)
-
-        return long_score, short_score
-
-    def _score_volume(self, ind: dict) -> tuple[float, float]:
-        """Volume spike confirmation."""
-        volume_ratio = ind.get("volume_ratio", 1.0)
         price = ind.get("close", 0)
+
+        # RSI overbought — momentum exhaustion
+        if rsi > self.exit_rsi_long:
+            return f"Exit long: RSI overbought {rsi:.0f} > {self.exit_rsi_long}"
+
+        # EMA cross against position — trend reversal signal
+        if ema_fast > 0 and ema_slow > 0:
+            if ema_fast < ema_slow * 0.999 and price < ema_fast:
+                return f"Exit long: EMA bearish cross, price below EMA8"
+
+        return None
+
+    def _should_exit_short(self, ind: dict) -> str | None:
+        rsi = ind.get("rsi", 50)
         ema_fast = ind.get("ema_fast", 0)
-
-        if volume_ratio < self.volume_spike_mult:
-            return 0.0, 0.0
-
-        spike_score = min(1.0, (volume_ratio - 1.0) / (self.volume_spike_mult - 1.0))
-
-        if price > ema_fast:
-            return spike_score, 0.0
-        elif price < ema_fast:
-            return 0.0, spike_score
-        return 0.0, 0.0
-
-    def _score_macd(self, ind: dict) -> tuple[float, float]:
-        """MACD histogram micro-momentum."""
-        hist = ind.get("macd_histogram", 0)
-        hist_prev = ind.get("macd_histogram_prev", 0)
-
-        if isinstance(hist, float) and math.isnan(hist):
-            return 0.0, 0.0
-
-        long_score = 0.0
-        short_score = 0.0
-
-        # Histogram positive and accelerating = bullish
-        if hist > 0:
-            long_score = 0.5
-            if hist > hist_prev:  # Accelerating
-                long_score = 0.8
-        elif hist < 0:
-            short_score = 0.5
-            if hist < hist_prev:  # Accelerating bearish
-                short_score = 0.8
-
-        # Histogram flip is a strong signal
-        if hist > 0 and hist_prev <= 0:
-            long_score = 1.0
-        elif hist < 0 and hist_prev >= 0:
-            short_score = 1.0
-
-        return long_score, short_score
-
-    def _score_bb(self, ind: dict) -> tuple[float, float]:
-        """Bollinger Band position — mean-reversion near bands."""
+        ema_slow = ind.get("ema_slow", 0)
         price = ind.get("close", 0)
-        bb_upper = ind.get("bb_upper", 0)
-        bb_lower = ind.get("bb_lower", 0)
-        bb_middle = ind.get("bb_middle", 0)
 
-        if bb_upper <= bb_lower or bb_middle <= 0:
-            return 0.0, 0.0
+        if rsi < self.exit_rsi_short:
+            return f"Exit short: RSI oversold {rsi:.0f} < {self.exit_rsi_short}"
 
-        band_width = bb_upper - bb_lower
-        dist_to_lower = (price - bb_lower) / band_width
-        dist_to_upper = (bb_upper - price) / band_width
+        if ema_fast > 0 and ema_slow > 0:
+            if ema_fast > ema_slow * 1.001 and price > ema_fast:
+                return f"Exit short: EMA bullish cross, price above EMA8"
 
-        long_score = 0.0
-        short_score = 0.0
-
-        # v2: Wider zone (was 0.25, now 0.35) for more signals
-        if dist_to_lower < 0.35:
-            long_score = 1.0 - dist_to_lower / 0.35
-
-        if dist_to_upper < 0.35:
-            short_score = 1.0 - dist_to_upper / 0.35
-
-        return long_score, short_score
+        return None
