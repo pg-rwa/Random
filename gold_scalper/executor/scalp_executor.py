@@ -43,6 +43,7 @@ class ScalpExecutor:
         direction_cooldown_sec: float = 120.0,
         log_dir: str = "gold_trades",
         learner: TradeLearner | None = None,
+        db=None,  # v5: SQLite database
         # v2 parameters
         use_atr_stops: bool = True,
         atr_sl_multiplier: float = 1.5,
@@ -84,6 +85,9 @@ class ScalpExecutor:
         # Auto-learning module (optional)
         self._learner = learner
         self._confidence_min: float = 0.0  # updated by learner
+
+        # v5: SQLite database
+        self._db = db
 
         # v3: Per-trade self-learning analyzer
         self._per_trade = PerTradeAnalyzer(
@@ -229,6 +233,8 @@ class ScalpExecutor:
             "hold_time_sec": int(time.time() - pos["open_time"]),
             "mode": "paper",
             "status": "closed",
+            "strategy": pos.get("strategy", ""),
+            "session": pos.get("session", ""),
         }
 
         # Update risk tracking
@@ -276,6 +282,13 @@ class ScalpExecutor:
 
         self._trade_log.append(trade_record)
         self._persist_trade(trade_record)
+
+        # v5: Log to SQLite database
+        if self._db:
+            try:
+                self._db.insert_trade(trade_record)
+            except Exception as e:
+                logger.warning("DB insert failed: %s", e)
 
         # v3: Record in per-trade analyzer for real-time learning
         self._per_trade.record_trade(
@@ -441,7 +454,15 @@ class ScalpExecutor:
             "open_time": time.time(),
             "confidence": signals.confidence,
             "trend": signals.trend,
+            "strategy": getattr(signals, "strategy", ""),
+            "session": "",
         }
+        # v5: Track session at entry
+        try:
+            from gold_scalper.strategy.scalper import current_session
+            position["session"] = current_session()
+        except Exception:
+            pass
 
         trade_record = {
             "timestamp": time.time(),
@@ -456,6 +477,8 @@ class ScalpExecutor:
             "notional_usd": effective_size_usd * self.leverage,
             "confidence": signals.confidence,
             "reasons": signals.reasons,
+            "strategy": getattr(signals, "strategy", ""),
+            "session": position.get("session", ""),
             "mode": "paper" if self.paper_trade else "live",
             "status": "filled",
         }
@@ -505,6 +528,14 @@ class ScalpExecutor:
 
         self._trade_log.append(trade_record)
         self._persist_trade(trade_record)
+
+        # v5: Log to SQLite database
+        if self._db:
+            try:
+                self._db.insert_trade(trade_record)
+            except Exception as e:
+                logger.warning("DB insert failed: %s", e)
+
         return trade_record
 
     def _persist_trade(self, trade: dict) -> None:

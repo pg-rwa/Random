@@ -1,66 +1,77 @@
-# Gold Scalper Configuration v2
-# Bollinger Band mean-reversion strategy on 1m candles
-# v2: Added trend filter, ATR stops, per-direction loss breaker, kill switch
+# Gold Scalper v5 Configuration
+# Session-aware pattern-based strategies + SQLite database
+# Paper trading on mainnet prices
 
 symbol: "xyz:GOLD"
 interval: "1m"
 candle_limit: 100
 loop_interval_seconds: 60
 leverage: 10
+db_path: "gold_trades/gold_scalper.db"
 
-# Strategy parameters (Bollinger Band + RSI)
+# Strategy parameters — session-aware, pattern-based
 strategy:
-  bb_period: 20
-  bb_std: 2.0
-  rsi_period: 14
-  rsi_oversold: 38.0        # v3: widened from 30 — was too strict, missed entries
-  rsi_overbought: 62.0      # v3: widened from 70 — symmetric with oversold
-  rsi_exit_long: 55.0       # Close long when RSI rises above this
-  rsi_exit_short: 45.0      # Close short when RSI drops below this
-  band_touch_pct: 0.30      # v3: widened from 0.15 — old value required price at extreme edge
-  min_bb_width_pct: 0.15    # v3: lowered from 0.25 — allow entries in tighter ranges
+  # Minimum confidence to act on any strategy signal
+  min_confidence: 0.50
+
+  # ATR volatility gate — skip entries in chaos
+  max_atr_pct: 0.5
+
+  # Indicator periods (used by all strategies)
   ema_fast: 9
   ema_slow: 21
-  ema_trend: 50             # v2: EMA50 for trend direction
+  ema_trend: 50
+  rsi_period: 14
+  bb_period: 20
+  bb_std: 2.0
 
-  # v2: Trend filter — skip counter-trend trades
-  use_trend_filter: true     # ENABLED: skip counter-trend trades
-  adx_range_threshold: 30    # v3: raised from 25 — allow more ranging-market entries
-  adx_trend_threshold: 40    # v3: raised from 30 — only block counter-trend in very strong trends
-  max_atr_pct: 0.5           # Skip entries when ATR > 0.5% of price (too volatile)
-  require_rsi_turn: false    # v3: disabled — was blocking entries where RSI was flat/lagging
+  # Exit thresholds
+  exit_rsi_long: 75
+  exit_rsi_short: 25
 
-# Executor parameters (trade sizing & risk)
+  # --- Asian Range Breakout (London open) ---
+  enable_asian_breakout: true
+  asian_min_range_pct: 0.05        # Min Asian range (% of price)
+  asian_max_range_pct: 0.40        # Max (too wide = news event, skip)
+  asian_breakout_buffer_pct: 0.01  # Buffer above/below range for entry
+  asian_volume_confirm: 1.1        # Volume > 1.1x avg to confirm break
+
+  # --- Liquidity Sweep (round number stop-hunts) ---
+  enable_liquidity_sweep: true
+  sweep_round_increment: 5.0       # Gold round numbers at $5 increments
+  sweep_wick_min_pct: 0.02         # Min sweep depth (% of price)
+  sweep_lookback: 5                # Candles to scan for sweep pattern
+  sweep_volume_confirm: 1.15       # Higher volume confirms institutional activity
+
+  # --- Session VWAP Reclaim ---
+  enable_session_vwap: true
+  vwap_min_volume_ratio: 1.2       # Volume > 1.2x avg
+  vwap_max_deviation_pct: 0.12     # Not too far from VWAP
+
+  # --- EMA Pullback (trend continuation) ---
+  enable_ema_pullback: true
+  ema_touch_tolerance_pct: 0.04    # How close price must get to EMA21
+  ema_rsi_upper: 70                # Don't buy when RSI > 70
+  ema_rsi_lower: 30                # Don't short when RSI < 30
+
+# Executor parameters
 executor:
-  tp_pct: 0.14              # Take profit: 0.14%
-  sl_pct: 0.14              # Stop loss: 0.14%
-  position_size_usd: 100.0  # Base margin per trade ($100 × 10x = $1000 notional)
-  max_consecutive_losses: 5  # Pause after 5 losses in a row (any direction)
-  cooldown_after_losses_sec: 300  # 5 min cooldown after global loss streak
-  daily_loss_limit_pct: 3.0  # Stop trading if down 3% of equity for the day
-  direction_cooldown_sec: 60   # v3: reduced from 120 — was skipping 2+ cycles after every close
+  tp_pct: 0.14
+  sl_pct: 0.14
+  position_size_usd: 100.0        # $100 x 10x = $1000 notional
+  max_consecutive_losses: 5
+  cooldown_after_losses_sec: 300
+  daily_loss_limit_pct: 3.0
+  direction_cooldown_sec: 60
 
-  # v2: ATR-based dynamic stops — scale with volatility
-  use_atr_stops: true         # Use ATR to set SL/TP dynamically
-  atr_sl_multiplier: 1.5     # SL = 1.5 × ATR (gives breathing room)
-  atr_tp_multiplier: 2.0     # TP = 2.0 × ATR (ensures R:R > 1)
+  # ATR-based dynamic stops
+  use_atr_stops: true
+  atr_sl_multiplier: 1.5
+  atr_tp_multiplier: 2.0
 
-  # v2: Per-direction consecutive loss breaker
-  max_dir_consecutive_losses: 3    # Pause a DIRECTION after 3 consecutive losses
-  dir_cooldown_after_losses_sec: 300  # v3: reduced from 600 — 5 min pause per direction
+  # Per-direction loss breaker
+  max_dir_consecutive_losses: 3
+  dir_cooldown_after_losses_sec: 300
 
-  # v2: Session drawdown protection
-  session_max_drawdown_usd: 20.0  # Stop trading if session drops $20 from peak
-
-# Auto-learner — adapts parameters based on trade history
-learner:
-  enabled: true
-  log_dir: "gold_trades"
-  lookback_days: 7
-  review_every_n_trades: 10        # v2: Review more frequently (was 20)
-  min_trades_to_learn: 15          # v2: Start learning sooner (was 30)
-  learning_rate: 0.25
-  enable_time_filter: true
-  enable_direction_filter: true
-  enable_tp_sl_tuning: true
-  enable_confidence_gate: true
+  # Session drawdown
+  session_max_drawdown_usd: 20.0
