@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from momentum_bot.exchange.base import ExchangeBase, OrderSide
-from momentum_bot.learner.per_trade_analyzer import PerTradeAnalyzer, EntryVerdict
+from momentum_bot.learner.per_trade_analyzer import PerTradeAnalyzer
 from gold_scalper.strategy.scalper import ScalpSignal, ScalpResult
 from gold_scalper.learner.trade_learner import TradeLearner
 
@@ -351,15 +351,8 @@ class ScalpExecutor:
                     logger.info("Learner: confidence %.3f < gate %.3f — skipping LONG",
                                 signals.confidence, self._confidence_min)
                     continue
-                # v3: Per-trade self-learning check
-                verdict = self._per_trade.should_enter(
-                    "long", signals.confidence, signals.trend,
-                )
-                if not verdict.allowed:
-                    logger.info("PerTrade BLOCKED LONG: %s", verdict.reasons)
-                    continue
                 trade = await self._open_position(
-                    "long", current_price, symbol, signals, verdict,
+                    "long", current_price, symbol, signals,
                 )
                 if trade:
                     executed.append(trade)
@@ -378,15 +371,8 @@ class ScalpExecutor:
                     logger.info("Learner: confidence %.3f < gate %.3f — skipping SHORT",
                                 signals.confidence, self._confidence_min)
                     continue
-                # v3: Per-trade self-learning check
-                verdict = self._per_trade.should_enter(
-                    "short", signals.confidence, signals.trend,
-                )
-                if not verdict.allowed:
-                    logger.info("PerTrade BLOCKED SHORT: %s", verdict.reasons)
-                    continue
                 trade = await self._open_position(
-                    "short", current_price, symbol, signals, verdict,
+                    "short", current_price, symbol, signals,
                 )
                 if trade:
                     executed.append(trade)
@@ -395,16 +381,9 @@ class ScalpExecutor:
 
     async def _open_position(
         self, direction: str, price: float, symbol: str, signals: ScalpResult,
-        verdict: EntryVerdict | None = None,
     ) -> dict | None:
         """Open a new scalp position."""
-        # v3: Apply per-trade sizing adjustments
         effective_size_usd = self.position_size_usd
-        if verdict and verdict.size_multiplier != 1.0:
-            effective_size_usd *= verdict.size_multiplier
-            logger.info("PerTrade sizing: $%.0f → $%.0f (×%.2f)",
-                        self.position_size_usd, effective_size_usd,
-                        verdict.size_multiplier)
 
         # Calculate size based on USD notional and leverage
         size = (effective_size_usd * self.leverage) / price
@@ -430,15 +409,11 @@ class ScalpExecutor:
             else:
                 stop_loss = price + sl_distance
                 take_profit = price - tp_distance
-            # v3: Apply per-trade stop adjustments
-            if verdict:
-                sl_distance *= verdict.sl_multiplier
-                tp_distance *= verdict.tp_multiplier
             logger.debug("ATR stops: ATR=%.2f SL_dist=%.2f TP_dist=%.2f", self._current_atr, sl_distance, tp_distance)
         else:
             # Fallback to fixed % stops
-            sl_pct = self.sl_pct * (verdict.sl_multiplier if verdict else 1.0)
-            tp_pct = self.tp_pct * (verdict.tp_multiplier if verdict else 1.0)
+            sl_pct = self.sl_pct
+            tp_pct = self.tp_pct
             if direction == "long":
                 stop_loss = price * (1 - sl_pct)
                 take_profit = price * (1 + tp_pct)
